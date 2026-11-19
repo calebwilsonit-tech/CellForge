@@ -269,8 +269,30 @@ vec4 sample(void* user, uint32_t unit, const vec4& coord) {
       const float r = shadow_cmp(t.zfunc, c[0], std::clamp(coord[2], 0.0f, 1.0f));
       return {r, r, r, r};
     }
+    if (t.signed_mask && t.format != 0x9A && t.format != 0x9B && t.format != 0x9C && t.format != 0x9F) {
+      for (int k = 0; k < 4; ++k) {
+        if (t.signed_mask & (1u << k)) {
+          const uint8_t u = uint8_t(std::clamp(c[k], 0.0f, 1.0f) * 255.0f + 0.5f);
+          c[k] = std::max(-1.0f, float(int8_t(u)) / 127.0f);
+        }
+      }
+    }
     if (t.is_srgb()) {
       for (int k = 0; k < 3; ++k) c[k] = srgb_to_linear_c(std::clamp(c[k], 0.0f, 1.0f));
+    }
+    if ((t.remap & 0xFFFFu) != 0xAAE4u) {
+      const float in_v[4] = {c[3], c[0], c[1], c[2]};  // 0=A, 1=R, 2=G, 3=B
+      auto map_ch = [&](uint32_t out_op, uint32_t in_sel) -> float {
+        if (out_op == 0) return 0.0f;
+        if (out_op == 1) return 1.0f;
+        return in_v[in_sel & 3];
+      };
+      c = {
+          map_ch((t.remap >> 10) & 3, (t.remap >> 2) & 3),  // R
+          map_ch((t.remap >> 12) & 3, (t.remap >> 4) & 3),  // G
+          map_ch((t.remap >> 14) & 3, (t.remap >> 6) & 3),  // B
+          map_ch((t.remap >> 8) & 3,  (t.remap >> 0) & 3),  // A
+      };
     }
     return c;
   };
@@ -433,6 +455,7 @@ void reset_defaults(uint32_t* r) {
   // plane (depth max, stencil 0). Found running a real homebrew GCM triangle.
   r[m::ZSTENCIL_CLEAR_VALUE] = 0xFFFFFF00;
   r[m::SURFACE_FORMAT] = 8 | (2 << 5);  // A8R8G8B8, Z24S8
+  for (uint32_t u = 0; u < 16; ++u) r[m::TEXTURE_BASE + 8 * u + 4] = 0x0000AAE4u;  // identity remap
 }
 
 void clear_depth(const DrawEnv& env, uint32_t mask) {
@@ -742,9 +765,12 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
     tu.wrap_r = (t[2] >> 16) & 0xF;
     tu.gamma = (t[2] >> 20) & 0xF;
     tu.zfunc = (t[2] >> 28) & 7;
+    tu.remap = t[4] & 0xFFFFu;
     tu.border_color = t[7];
     const uint32_t mag_f = (t[5] >> 24) & 7;
     const uint32_t min_f = (t[5] >> 16) & 7;
+    tu.signed_mask = uint8_t(((t[5] >> 29) & 1u) | (((t[5] >> 30) & 1u) << 1) |
+                             (((t[5] >> 31) & 1u) << 2) | (((t[5] >> 28) & 1u) << 3));
     tu.mag_linear = (mag_f == 2 || mag_f == 4);
     tu.min_linear = (min_f == 2 || min_f == 4 || min_f == 6 || min_f == 7);
     tu.use_mip = (min_f >= 3 && min_f <= 6) && tu.mipmap > 1;
@@ -774,6 +800,9 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
   d.cull = r[m::CULL_FACE_ENABLE] != 0;
   d.cull_face = r[m::CULL_FACE];
   d.front_ccw = r[m::FRONT_FACE] != 0x900;
+  d.poly_offset = r[m::POLY_OFFSET_FILL_ENABLE] != 0;
+  d.poly_offset_scale = fbits(r[m::POLYGON_OFFSET_SCALE_FACTOR]);
+  d.poly_offset_bias = fbits(r[m::POLYGON_OFFSET_BIAS]);
   return true;
 }
 

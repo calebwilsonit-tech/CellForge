@@ -173,7 +173,7 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
       const int lx = 20, lw = 195, cx = 225, cw = 250;
       int y = 16;
-      mk(hwnd, s->f_hdr, L"STATIC", L"Display & Graphics Settings", 0, lx, y, 440, 24);
+      mk(hwnd, s->f_hdr, L"STATIC", L"Display && Graphics Settings", 0, lx, y, 440, 24);
       y += 34;
 
       auto add_combo = [&](const wchar_t* label, int id) -> HWND {
@@ -327,7 +327,7 @@ bool show_settings_dialog(const std::filesystem::path& options_ini, void* owner_
   wc.lpszClassName = kCls;
   RegisterClassExW(&wc);
 
-  const int W = 515, H = 560;
+  const int W = 515, H = 600;
   RECT area{};
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
   const int x = (area.left + area.right - W) / 2;

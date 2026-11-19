@@ -22,9 +22,10 @@ constexpr uint32_t SURFACE_CLIP_H = 0x80, SURFACE_CLIP_V = 0x81, SURFACE_FORMAT 
                    SURFACE_PITCH_Z = 0x8B;
 constexpr uint32_t ALPHA_TEST_ENABLE = 0xC1, ALPHA_FUNC = 0xC2, ALPHA_REF = 0xC3;
 constexpr uint32_t BLEND_ENABLE = 0xC4, BLEND_SFACTOR = 0xC5, BLEND_DFACTOR = 0xC6, BLEND_COLOR = 0xC7,
-                   BLEND_EQUATION = 0xC8, COLOR_MASK = 0xC9, BLEND_COLOR2 = 0xDF;
+                   BLEND_EQUATION = 0xC8, COLOR_MASK = 0xC9, POLY_OFFSET_FILL_ENABLE = 0xD8, BLEND_COLOR2 = 0xDF;
 constexpr uint32_t SCISSOR_H = 0x230, SCISSOR_V = 0x231, SHADER_PROGRAM = 0x239;
 constexpr uint32_t VIEWPORT_H = 0x280, VIEWPORT_V = 0x281, VIEWPORT_OFFSET = 0x288, VIEWPORT_SCALE = 0x28C;
+constexpr uint32_t POLYGON_OFFSET_SCALE_FACTOR = 0x298, POLYGON_OFFSET_BIAS = 0x299;
 constexpr uint32_t DEPTH_FUNC = 0x29B, DEPTH_MASK = 0x29C, DEPTH_TEST_ENABLE = 0x29D;
 constexpr uint32_t TRANSFORM_PROGRAM = 0x2E0;  // 32-word window
 constexpr uint32_t VERTEX_ARRAY_OFFSET = 0x5A0, VERTEX_ARRAY_FORMAT = 0x5D0;  // 16 each
@@ -70,6 +71,8 @@ struct TexUnit {
   bool linear_layout = false, unnormalized = false;
   uint32_t wrap_s = 1, wrap_t = 1, wrap_r = 1;
   uint32_t gamma = 0, zfunc = 7, border_color = 0;
+  uint32_t remap = 0x0000AAE4u;  // NV4097_SET_TEXTURE_CONTROL1 channel remap (default identity)
+  uint8_t signed_mask = 0;       // bit0=R, bit1=G, bit2=B, bit3=A (from TEXTURE_FILTER bits 28..31)
   bool bilinear = false, mag_linear = false, min_linear = false;
   bool use_mip = false, mip_linear = false;
   float lod_bias = 0.0f;
@@ -115,6 +118,8 @@ struct PreparedDraw {
   bool cull = false;
   uint32_t cull_face = 0x405;
   bool front_ccw = true;
+  bool poly_offset = false;
+  float poly_offset_scale = 0.0f, poly_offset_bias = 0.0f;
   float vp_scale[3]{}, vp_offset[3]{};
   uint32_t aa_x = 1, aa_y = 1;
   bool fp32_out = true;

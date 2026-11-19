@@ -47,7 +47,7 @@ namespace {
   X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments)                        \
   X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)          \
   X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                \
-  X(vkCmdSetBlendConstants) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateBuffer)                           \
+  X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateBuffer)                           \
   X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) X(vkFreeMemory)               \
   X(vkBindBufferMemory) X(vkMapMemory) X(vkUnmapMemory) X(vkCreateImage) X(vkDestroyImage)              \
   X(vkGetImageMemoryRequirements) X(vkBindImageMemory) X(vkCreateImageView) X(vkDestroyImageView)       \
@@ -118,6 +118,36 @@ VkSamplerAddressMode address_mode(uint32_t w) {
   }
 }
 
+VkComponentMapping remap_to_vk(uint32_t remap) {
+  auto map_ch = [](uint32_t out_op, uint32_t in_sel) -> VkComponentSwizzle {
+    if (out_op == 0) return VK_COMPONENT_SWIZZLE_ZERO;
+    if (out_op == 1) return VK_COMPONENT_SWIZZLE_ONE;
+    static constexpr VkComponentSwizzle kIn[4] = {
+        VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B};
+    return kIn[in_sel & 3];
+  };
+  return {
+      map_ch((remap >> 10) & 3, (remap >> 2) & 3),  // R
+      map_ch((remap >> 12) & 3, (remap >> 4) & 3),  // G
+      map_ch((remap >> 14) & 3, (remap >> 6) & 3),  // B
+      map_ch((remap >> 8) & 3,  (remap >> 0) & 3),  // A
+  };
+}
+
+uint16_t float_to_half(float f) {
+  const uint32_t b = std::bit_cast<uint32_t>(f);
+  const uint32_t sign = (b >> 16) & 0x8000u;
+  const int32_t exp = int32_t((b >> 23) & 0xFFu) - 127;
+  const uint32_t mant = b & 0x7FFFFFu;
+  if (exp > 15) return uint16_t(sign | 0x7C00u | (exp == 128 && mant ? 0x0200u : 0u));
+  if (exp < -14) {
+    if (exp < -24) return uint16_t(sign);
+    const uint32_t m = (mant | 0x800000u) >> (-14 - exp + 13);
+    return uint16_t(sign | m);
+  }
+  return uint16_t(sign | (uint32_t(exp + 15) << 10) | (mant >> 13));
+}
+
 struct Buffer {
   VkBuffer buf = VK_NULL_HANDLE;
   VkDeviceMemory mem = VK_NULL_HANDLE;
@@ -130,7 +160,12 @@ struct Image {
   VkDeviceMemory mem = VK_NULL_HANDLE;
   VkImageView view = VK_NULL_HANDLE;
   VkImageView srgb_view = VK_NULL_HANDLE;
+  VkFormat fmt = VK_FORMAT_UNDEFINED;
+  VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+  VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+  uint32_t mip_levels = 1, layers = 1;
   uint32_t w = 0, h = 0, d = 1;
+  std::map<uint32_t, VkImageView> remap_views;
 };
 
 struct Surface {
@@ -251,6 +286,7 @@ class VulkanRenderer final : public GpuRenderer {
   bool make_image(Image& im, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
                   uint32_t d = 1, bool is_3d = false, bool mutable_srgb = false, uint32_t mip_levels = 1,
                   bool is_cube = false);
+  VkImageView get_view(Image& im, bool srgb, uint32_t remap);
   void free_image(Image& im);
   void begin();
   void barrier_all();
@@ -288,6 +324,7 @@ class VulkanRenderer final : public GpuRenderer {
   std::string name_;
   bool depth_clamp_ = false;
   bool aniso_enabled_ = false;
+  bool bc_enabled_ = false;
   float max_aniso_ = 1.0f;
   VkPipelineCache pipe_cache_ = VK_NULL_HANDLE;
   std::filesystem::path pipe_cache_path_;
@@ -451,6 +488,8 @@ bool VulkanRenderer::init() {
   want.depthClamp = have.depthClamp;
   aniso_enabled_ = have.samplerAnisotropy == VK_TRUE && max_aniso_ > 1.0f;
   want.samplerAnisotropy = aniso_enabled_ ? VK_TRUE : VK_FALSE;
+  bc_enabled_ = have.textureCompressionBC == VK_TRUE;
+  want.textureCompressionBC = bc_enabled_ ? VK_TRUE : VK_FALSE;
   const float prio = 1.0f;
   VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   qci.queueFamilyIndex = queue_family_;
@@ -813,13 +852,41 @@ bool VulkanRenderer::make_image(Image& im, uint32_t w, uint32_t h, VkFormat fmt,
     vci.format = VK_FORMAT_R8G8B8A8_SRGB;
     if (vk_.vkCreateImageView(device_, &vci, nullptr, &im.srgb_view) != VK_SUCCESS) im.srgb_view = VK_NULL_HANDLE;
   }
+  im.fmt = fmt;
+  im.view_type = vci.viewType;
+  im.aspect = aspect;
+  im.mip_levels = ici.mipLevels;
+  im.layers = layers;
   im.w = w;
   im.h = h;
   im.d = is_3d ? std::max(1u, d) : 1u;
   return true;
 }
 
+VkImageView VulkanRenderer::get_view(Image& im, bool srgb, uint32_t remap) {
+  remap &= 0xFFFFu;
+  if (im.aspect == VK_IMAGE_ASPECT_DEPTH_BIT) return im.view;
+  if (remap == 0xAAE4u) return (srgb && im.srgb_view) ? im.srgb_view : im.view;
+  const bool use_srgb = srgb && im.srgb_view != VK_NULL_HANDLE;
+  const uint32_t key = (use_srgb ? 0x10000u : 0u) | remap;
+  auto it = im.remap_views.find(key);
+  if (it != im.remap_views.end()) return it->second;
+  VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vci.image = im.img;
+  vci.viewType = im.view_type;
+  vci.format = use_srgb ? VK_FORMAT_R8G8B8A8_SRGB : im.fmt;
+  vci.components = remap_to_vk(remap);
+  vci.subresourceRange = {im.aspect, 0, im.mip_levels, 0, im.layers};
+  VkImageView v = VK_NULL_HANDLE;
+  if (vk_.vkCreateImageView(device_, &vci, nullptr, &v) != VK_SUCCESS)
+    return use_srgb ? im.srgb_view : im.view;
+  im.remap_views[key] = v;
+  return v;
+}
+
 void VulkanRenderer::free_image(Image& im) {
+  for (auto& [k, v] : im.remap_views) vk_.vkDestroyImageView(device_, v, nullptr);
+  im.remap_views.clear();
   if (im.srgb_view) vk_.vkDestroyImageView(device_, im.srgb_view, nullptr);
   if (im.view) vk_.vkDestroyImageView(device_, im.view, nullptr);
   if (im.img) vk_.vkDestroyImage(device_, im.img, nullptr);
@@ -1085,7 +1152,9 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       (uint64_t(d) * 0x517CC1B727220A95ull) ^ (uint64_t(t.dimension) << 60) ^
       (t.linear_layout ? 0x5555ull : 0ull) ^ (t.is_srgb() ? 0xAAAA0000ull : 0ull) ^
       (t.is_shadow() ? 0x333300000000ull : 0ull) ^ (t.cubemap ? 0x77770000000000ull : 0ull) ^
+      (uint64_t(t.signed_mask) * 0xD6E8FEB86659FD93ull) ^
       (uint64_t(max_mips) * 0xBF58476D1CE4E5B9ull) ^ (uint64_t(t.pitch) * 0x9E3779B97F4A7C15ull);
+  const uint64_t cache_key = desc_key ^ (uint64_t(t.remap & 0xFFFFu) * 0x2545F4914F6CDD1Dull);
 
   bool dynamic_rt = false;
   uint64_t surf_mix = 0;
@@ -1095,9 +1164,9 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       dynamic_rt = true;
     }
   }
-  // Per-frame fast path: static textures already verified this frame skip re-hashing.
+  // Persistent fast path: static textures already verified skip re-hashing across frames.
   if (!dynamic_rt) {
-    auto fc = frame_tex_cache_.find(desc_key);
+    auto fc = frame_tex_cache_.find(cache_key);
     if (fc != frame_tex_cache_.end()) return fc->second;
   }
 
@@ -1105,8 +1174,9 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   auto it = textures_.find(h);
   if (it != textures_.end()) {
     it->second.last_flush = flush_seq_;
-    if (!dynamic_rt) frame_tex_cache_[desc_key] = it->second.image.view;
-    return it->second.image.view;
+    const VkImageView view = get_view(it->second.image, false, t.remap);
+    if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+    return view;
   }
 
   Texture tex;
@@ -1162,10 +1232,191 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
     return view;
   }
 
+  const uint32_t layers = t.cubemap ? 6u : 1u;
+
+  // Native hardware BC1/BC2/BC3 (DXT1/DXT3/DXT5) upload: zero CPU decompression, zero mipgen blits, 4x-8x less VRAM.
+  if (bc_enabled_ && (t.format == 0x86 || t.format == 0x87 || t.format == 0x88) &&
+      t.signed_mask == 0 && !t.is_3d() && t.width >= 4 && t.height >= 4 &&
+      (t.width & 3u) == 0 && (t.height & 3u) == 0) {
+    const uint32_t bsize = (t.format == 0x86) ? 8u : 16u;
+    const VkFormat bc_fmt =
+        (t.format == 0x86) ? (t.is_srgb() ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK)
+        : (t.format == 0x87) ? (t.is_srgb() ? VK_FORMAT_BC2_SRGB_BLOCK : VK_FORMAT_BC2_UNORM_BLOCK)
+                             : (t.is_srgb() ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK);
+    const uint32_t face_stride = t.cubemap ? t.cube_face_stride() : 0u;
+    VkDeviceSize total_bytes = 0;
+    uint32_t mw = t.width, mh = t.height;
+    for (uint32_t lvl = 0; lvl < max_mips; ++lvl) {
+      total_bytes += VkDeviceSize((mw + 3u) / 4u) * ((mh + 3u) / 4u) * bsize * layers;
+      mw = std::max(1u, mw >> 1);
+      mh = std::max(1u, mh >> 1);
+    }
+    VkDeviceSize off = 0;
+    if (ring_alloc(upload_, total_bytes, off)) {
+      if (!make_image(tex.image, t.width, t.height, bc_fmt,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT, 1, false, false, max_mips, t.cubemap)) {
+        if (error) *error = "bc texture allocation failed";
+        return VK_NULL_HANDLE;
+      }
+      std::vector<VkBufferImageCopy> copies;
+      copies.reserve(size_t(max_mips) * layers);
+      VkDeviceSize cur_off = off;
+      for (uint32_t face = 0; face < layers; ++face) {
+        const uint8_t* src = t.base + size_t(face) * face_stride;
+        mw = t.width; mh = t.height;
+        for (uint32_t lvl = 0; lvl < max_mips; ++lvl) {
+          const uint32_t bw = (mw + 3u) / 4u, bh = (mh + 3u) / 4u;
+          const size_t lvl_bytes = size_t(bw) * bh * bsize;
+          std::memcpy(upload_.ptr + cur_off, src, lvl_bytes);
+          VkBufferImageCopy c{};
+          c.bufferOffset = cur_off;
+          c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lvl, face, 1};
+          c.imageExtent = {mw, mh, 1};
+          copies.push_back(c);
+          src += lvl_bytes;
+          cur_off += lvl_bytes;
+          mw = std::max(1u, mw >> 1);
+          mh = std::max(1u, mh >> 1);
+        }
+      }
+      begin();
+      transition_general(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, max_mips, layers);
+      vk_.vkCmdCopyBufferToImage(cmd_, upload_.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL,
+                                 uint32_t(copies.size()), copies.data());
+      barrier_all();
+      auto& stored = textures_[h] = std::move(tex);
+      const VkImageView view = get_view(stored.image, false, t.remap);
+      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      return view;
+    }
+  }
+
+  // Float / HDR textures (0x9A W16Z16Y16X16F, 0x9B W32Z32Y32X32F, 0x9C X32F, 0x9F Y16X16F):
+  // upload directly as floating-point formats to preserve HDR > 1.0 and negative values (IBL/irradiance cubemaps, LUTs).
+  if (t.format == 0x9A || t.format == 0x9B || t.format == 0x9C || t.format == 0x9F) {
+    const bool fp32 = (t.format == 0x9B || t.format == 0x9C);
+    const VkFormat ffmt = fp32 ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    const size_t px_per_face = size_t(t.width) * t.height * d;
+    const size_t total_px = px_per_face * layers;
+    const size_t elem_bytes = fp32 ? 16u : 8u;
+    const uint32_t src_bpp = (t.format == 0x9A) ? 8u : (t.format == 0x9B) ? 16u : 4u;
+    const uint32_t face_stride = t.cubemap ? t.cube_face_stride() : 0u;
+    const uint32_t lw = uint32_t(std::countr_zero(std::bit_ceil(t.width)));
+    const uint32_t lh = uint32_t(std::countr_zero(std::bit_ceil(t.height)));
+    const uint32_t ld = uint32_t(std::countr_zero(std::bit_ceil(d)));
+    auto morton_off = [&](uint32_t x, uint32_t y, uint32_t z) -> uint32_t {
+      uint32_t o = 0, sh = 0;
+      if (t.is_3d()) {
+        const uint32_t ml = std::max({lw, lh, ld});
+        for (uint32_t i = 0; i < ml; ++i) {
+          if (i < lw) o |= ((x >> i) & 1u) << sh++;
+          if (i < lh) o |= ((y >> i) & 1u) << sh++;
+          if (i < ld) o |= ((z >> i) & 1u) << sh++;
+        }
+      } else {
+        const uint32_t both = std::min(lw, lh);
+        for (uint32_t i = 0; i < both; ++i) {
+          o |= ((x >> i) & 1u) << sh++;
+          o |= ((y >> i) & 1u) << sh++;
+        }
+        o |= ((lw > lh ? (x >> both) : (y >> both)) << sh);
+      }
+      return o;
+    };
+    VkDeviceSize off = 0;
+    if (ring_alloc(upload_, VkDeviceSize(total_px) * elem_bytes, off)) {
+      if (!make_image(tex.image, t.width, t.height, ffmt,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT, d, t.is_3d(), false, 1, t.cubemap)) {
+        if (error) *error = "float texture allocation failed";
+        return VK_NULL_HANDLE;
+      }
+      uint8_t* dst_base = upload_.ptr + off;
+      const uint32_t stride = t.pitch ? t.pitch : t.width * src_bpp;
+      for (uint32_t face = 0; face < layers; ++face) {
+        const uint8_t* fbase = t.base + size_t(face) * face_stride;
+        for (uint32_t z = 0; z < d; ++z) {
+          for (uint32_t y = 0; y < t.height; ++y) {
+            for (uint32_t x = 0; x < t.width; ++x) {
+              const size_t pos = t.linear_layout
+                  ? ((size_t(z) * t.height + y) * stride + size_t(x) * src_bpp)
+                  : (size_t(morton_off(x, y, z)) * src_bpp);
+              const uint8_t* p = fbase + pos;
+              const size_t idx = (size_t(face) * px_per_face) + (size_t(z) * t.height + y) * t.width + x;
+              if (t.format == 0x9A) {
+                uint16_t* o = reinterpret_cast<uint16_t*>(dst_base + idx * 8);
+                o[0] = be16(p); o[1] = be16(p + 2); o[2] = be16(p + 4); o[3] = be16(p + 6);
+              } else if (t.format == 0x9F) {
+                uint16_t* o = reinterpret_cast<uint16_t*>(dst_base + idx * 8);
+                o[0] = be16(p); o[1] = be16(p + 2); o[2] = 0x0000u; o[3] = 0x3C00u;  // 0.0h, 1.0h
+              } else if (t.format == 0x9B) {
+                uint32_t* o = reinterpret_cast<uint32_t*>(dst_base + idx * 16);
+                o[0] = be32(p); o[1] = be32(p + 4); o[2] = be32(p + 8); o[3] = be32(p + 12);
+              } else {  // 0x9C X32_FLOAT
+                uint32_t* o = reinterpret_cast<uint32_t*>(dst_base + idx * 16);
+                const uint32_t v = be32(p);
+                o[0] = v; o[1] = v; o[2] = v; o[3] = v;
+              }
+            }
+          }
+        }
+      }
+      begin();
+      transition_general(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, 1, layers);
+      VkBufferImageCopy c{};
+      c.bufferOffset = off;
+      c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+      c.imageExtent = {t.width, t.height, d};
+      vk_.vkCmdCopyBufferToImage(cmd_, upload_.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+      barrier_all();
+      auto& stored = textures_[h] = std::move(tex);
+      const VkImageView view = get_view(stored.image, false, t.remap);
+      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      return view;
+    }
+  }
+
   std::vector<uint32_t> rgba;
   decode_texture_rgba(t, rgba);
+
+  // Signed channel textures (TEXTURE_FILTER bits 28..31): upload as R16G16B16A16_SFLOAT so negative values are preserved.
+  if (t.signed_mask != 0) {
+    VkDeviceSize off = 0;
+    if (ring_alloc(upload_, VkDeviceSize(rgba.size()) * 8, off)) {
+      if (!make_image(tex.image, t.width, t.height, VK_FORMAT_R16G16B16A16_SFLOAT,
+                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_IMAGE_ASPECT_COLOR_BIT, d, t.is_3d(), false, 1, t.cubemap)) {
+        if (error) *error = "signed texture allocation failed";
+        return VK_NULL_HANDLE;
+      }
+      uint16_t* dst = reinterpret_cast<uint16_t*>(upload_.ptr + off);
+      for (size_t i = 0; i < rgba.size(); ++i) {
+        const uint32_t px = rgba[i];
+        for (int k = 0; k < 4; ++k) {
+          const uint8_t b = uint8_t((px >> (8 * k)) & 0xFFu);
+          const float v = (t.signed_mask & (1u << k))
+                              ? std::max(-1.0f, float(int8_t(b)) / 127.0f)
+                              : (b / 255.0f);
+          dst[i * 4 + k] = float_to_half(v);
+        }
+      }
+      begin();
+      transition_general(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, 1, layers);
+      VkBufferImageCopy c{};
+      c.bufferOffset = off;
+      c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
+      c.imageExtent = {t.width, t.height, d};
+      vk_.vkCmdCopyBufferToImage(cmd_, upload_.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+      barrier_all();
+      auto& stored = textures_[h] = std::move(tex);
+      const VkImageView view = get_view(stored.image, false, t.remap);
+      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      return view;
+    }
+  }
+
   const VkFormat fmt = t.is_srgb() ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-  const uint32_t layers = t.cubemap ? 6u : 1u;
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                   (max_mips > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
   if (!make_image(tex.image, t.width, t.height, fmt, usage, VK_IMAGE_ASPECT_COLOR_BIT, d, t.is_3d(), false, max_mips,
@@ -1214,9 +1465,9 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
     }
   }
   barrier_all();
-  const VkImageView view = tex.image.view;
-  textures_[h] = tex;
-  if (!dynamic_rt) frame_tex_cache_[desc_key] = view;
+  auto& stored = textures_[h] = std::move(tex);
+  const VkImageView view = get_view(stored.image, false, t.remap);
+  if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
   return view;
 }
 
@@ -1292,7 +1543,7 @@ VkImageView VulkanRenderer::composite(const TexUnit& t, const std::vector<Surfac
     vk_.vkCmdCopyImage(cmd_, p.s->image.img, VK_IMAGE_LAYOUT_GENERAL, img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
   }
   barrier_all();
-  return (t.is_srgb() && img.srgb_view) ? img.srgb_view : img.view;
+  return get_view(img, t.is_srgb(), t.remap);
 }
 
 VkSampler VulkanRenderer::sampler(const TexUnit& t) {
@@ -1437,6 +1688,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   mix(vp && d.cull ? 1u : 0u);
   mix(vp && d.cull ? d.cull_face : 0u);
   mix(vp && d.cull ? (d.front_ccw ? 1u : 0u) : 0u);
+  mix(d.poly_offset ? 1u : 0u);
   auto it = pipelines_.find(key);
   if (it != pipelines_.end()) return it->second;
 
@@ -1503,6 +1755,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   vps.scissorCount = 1;
   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
   rs.depthClampEnable = depth_clamp_ ? VK_TRUE : VK_FALSE;  // the RSX clamps window z rather than clipping
+  rs.depthBiasEnable = d.poly_offset ? VK_TRUE : VK_FALSE;
   rs.polygonMode = VK_POLYGON_MODE_FILL;
   if (vp) {
     if (!d.cull) rs.cullMode = VK_CULL_MODE_NONE;
@@ -1537,9 +1790,10 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   VkPipelineColorBlendStateCreateInfo cbs{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
   cbs.attachmentCount = 1;
   cbs.pAttachments = &cb;
-  const VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+  const VkDynamicState dyn[4] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+                                 VK_DYNAMIC_STATE_DEPTH_BIAS};
   VkPipelineDynamicStateCreateInfo dy{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-  dy.dynamicStateCount = 3;
+  dy.dynamicStateCount = 4;
   dy.pDynamicStates = dyn;
 
   VkGraphicsPipelineCreateInfo gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
@@ -1700,7 +1954,7 @@ VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_co
       continue;
     // 1. ARGB color surface sampled as A8R8G8B8 / D8R8G8B8.
     if (!s->depth && s->argb && (t.format == 0x85 || t.format == 0x9E)) {
-      if (s.get() != active_color) return (t.is_srgb() && s->image.srgb_view) ? s->image.srgb_view : s->image.view;
+      if (s.get() != active_color) return get_view(s->image, t.is_srgb(), t.remap);
       // Self-feedback: copy active render target into a cached snapshot image on the GPU.
       auto& c = converted_[{s->addr, s->image.w, s->image.h, 0xFFu}];
       if (!c.image.img) {
@@ -1724,7 +1978,7 @@ VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_co
         barrier_all();
         c.write_seq = s->write_seq;
       }
-      return (t.is_srgb() && c.image.srgb_view) ? c.image.srgb_view : c.image.view;
+      return get_view(c.image, t.is_srgb(), t.remap);
     }
     // 2. Depth surface sampled as depth format (0x8F..0x92): direct sample (swizzled R,R,R,1).
     if (s->depth && t.is_depth_fmt() && s.get() != active_depth) return s->image.view;
@@ -1750,7 +2004,7 @@ VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_co
         transition_general(c.image.img, VK_IMAGE_ASPECT_COLOR_BIT);
       }
       if (c.write_seq != s->write_seq && !run_convert_pass(*s, c, pipe_d24_argb_, rp_color_)) return VK_NULL_HANDLE;
-      return (t.is_srgb() && c.image.srgb_view) ? c.image.srgb_view : c.image.view;
+      return get_view(c.image, t.is_srgb(), t.remap);
     }
     // 4. ABGR color surface sampled as Y16_X16 (0x95, shadow atlas): GPU 16-bit conversion pass.
     if (!s->depth && !s->argb && t.format == 0x95 && s.get() != active_color && pipe_abgr_y16x16_) {
@@ -1773,7 +2027,7 @@ VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_co
         transition_general(c.image.img, VK_IMAGE_ASPECT_COLOR_BIT);
       }
       if (c.write_seq != s->write_seq && !run_convert_pass(*s, c, pipe_abgr_y16x16_, rp_r16g16_)) return VK_NULL_HANDLE;
-      return c.image.view;
+      return get_view(c.image, false, t.remap);
     }
   }
   return VK_NULL_HANDLE;
@@ -1922,6 +2176,8 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
   const float bc[4] = {((d.blend_color >> 16) & 0xFF) / 255.0f, ((d.blend_color >> 8) & 0xFF) / 255.0f,
                        (d.blend_color & 0xFF) / 255.0f, ((d.blend_color >> 24) & 0xFF) / 255.0f};
   vk_.vkCmdSetBlendConstants(cmd_, bc);
+  vk_.vkCmdSetDepthBias(cmd_, d.poly_offset ? d.poly_offset_bias : 0.0f, 0.0f,
+                        d.poly_offset ? d.poly_offset_scale : 0.0f);
   vk_.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
   vk_.vkCmdBindVertexBuffers(cmd_, 0, 1, &vertex_.buf, &voff);
   vk_.vkCmdDraw(cmd_, uint32_t(d.tris.size()), 1, 0, 0);
@@ -2082,9 +2338,10 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
     uint8_t* dst = const_buf_.ptr + vpoff;
     std::memcpy(dst, vp_s, 16);
     std::memcpy(dst + 16, vp_o, 16);
-    const size_t n_c = std::min<size_t>(512, env.vp->constants.size());
-    std::memcpy(dst + 32, env.vp->constants.data(), n_c * 16);
-    if (n_c < 512) std::memset(dst + 32 + n_c * 16, 0, (512 - n_c) * 16);
+    const size_t max_c = vp->meta.uses_rel_const ? 512 : std::min<size_t>(512, size_t(vp->meta.max_const) + 1);
+    const size_t n_c = std::min<size_t>(max_c, env.vp->constants.size());
+    if (n_c > 0) std::memcpy(dst + 32, env.vp->constants.data(), n_c * 16);
+    if (n_c < max_c) std::memset(dst + 32 + n_c * 16, 0, (max_c - n_c) * 16);
     if (env.vp->const_ver > 1) {
       last_vp_ubo_ptr_ = env.vp;
       last_vp_ubo_ver_ = env.vp->const_ver;
@@ -2141,6 +2398,8 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   const float bc[4] = {((d.blend_color >> 16) & 0xFF) / 255.0f, ((d.blend_color >> 8) & 0xFF) / 255.0f,
                        (d.blend_color & 0xFF) / 255.0f, ((d.blend_color >> 24) & 0xFF) / 255.0f};
   vk_.vkCmdSetBlendConstants(cmd_, bc);
+  vk_.vkCmdSetDepthBias(cmd_, d.poly_offset ? d.poly_offset_bias : 0.0f, 0.0f,
+                        d.poly_offset ? d.poly_offset_scale : 0.0f);
   vk_.vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 1, &set, 0, nullptr);
   if (vp->meta.in_count > 0) vk_.vkCmdBindVertexBuffers(cmd_, 0, 1, &vertex_.buf, &voff);
   vk_.vkCmdBindIndexBuffer(cmd_, index_.buf, ioff, VK_INDEX_TYPE_UINT32);
@@ -2326,17 +2585,17 @@ void VulkanRenderer::evict_textures() {
       ++it;
     }
   }
-  if (textures_.size() <= 4096) return;
+  if (textures_.size() <= 8192) return;
   // Evict textures not used in recent flushes instead of wiping the entire cache.
   for (auto it = textures_.begin(); it != textures_.end();) {
-    if (flush_seq_ - it->second.last_flush > 60) {
+    if (flush_seq_ - it->second.last_flush > 120) {
       free_image(it->second.image);
       it = textures_.erase(it);
     } else {
       ++it;
     }
   }
-  if (textures_.size() > 4096) {
+  if (textures_.size() > 8192) {
     vk_.vkDeviceWaitIdle(device_);
     for (auto& [k, t] : textures_) free_image(t.image);
     textures_.clear();

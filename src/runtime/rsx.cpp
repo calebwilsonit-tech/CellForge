@@ -328,7 +328,8 @@ void Rsx::flip(uint32_t id, bool immediate) {
   } else if (GpuRenderer* g = gpu()) {
     g->flip_async(K().base(), 0, 0, nullptr);
   }
-  if (!immediate && flip_mode.load() == 2 && !stop_) {
+  const bool vblank_paced = !immediate && flip_mode.load() == 2 && !stop_;
+  if (vblank_paced) {
     uint64_t vb = stats.vblanks.load();
     if (vb == last_flip_vblank_) {
       poll_gpu();
@@ -339,15 +340,36 @@ void Rsx::flip(uint32_t id, bool immediate) {
     poll_gpu();
     last_flip_vblank_ = vb;
   }
+  // Only apply the software FPS cap when VBlank isn't already pacing at 60 Hz;
+  // use a high-resolution timer on Windows so sleeps don't quantize to 15.6 ms ticks.
   const int cap = cfg::g_fps_cap.load(std::memory_order_relaxed);
-  if (cap > 0 && last_flip_time > 0 && !stop_) {
+  if (cap > 0 && !(vblank_paced && cap == 60) && !stop_) {
     const uint64_t target_us = 1000000ull / uint64_t(cap);
-    const uint64_t elapsed = lv2::system_time_us() - last_flip_time;
-    if (elapsed < target_us) {
-      std::this_thread::sleep_for(std::chrono::microseconds(target_us - elapsed));
+    const uint64_t now_us = lv2::system_time_us();
+    if (last_flip_time > 0 && now_us < last_flip_time + target_us) {
+      const uint64_t wait_us = (last_flip_time + target_us) - now_us;
+#if defined(_WIN32)
+      static thread_local HANDLE cap_timer = [] {
+        HANDLE h = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /*HIGH_RESOLUTION*/, TIMER_ALL_ACCESS);
+        return h ? h : CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+      }();
+      LARGE_INTEGER due;
+      due.QuadPart = -int64_t(std::max<uint64_t>(1, wait_us * 10));
+      if (cap_timer && SetWaitableTimer(cap_timer, &due, 0, nullptr, nullptr, FALSE))
+        WaitForSingleObject(cap_timer, INFINITE);
+      else
+        std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
+#else
+      std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
+#endif
     }
+    const uint64_t after_us = lv2::system_time_us();
+    last_flip_time = (last_flip_time > 0 && after_us < last_flip_time + target_us * 2)
+                         ? (last_flip_time + target_us)
+                         : after_us;
+  } else {
+    last_flip_time = lv2::system_time_us();
   }
-  last_flip_time = lv2::system_time_us();
   ++stats.flips;
   flip_status = 0;
   call_handler(flip_handler, 1);

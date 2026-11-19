@@ -21,7 +21,7 @@ enum : uint32_t {
   OpIAdd = 128, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136, OpVectorTimesScalar = 142,
   OpDot = 148, OpAny = 154, OpLogicalAnd = 167, OpSelect = 169, OpFOrdEqual = 180, OpFOrdNotEqual = 182,
   OpFUnordNotEqual = 183, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186, OpFOrdLessThanEqual = 188,
-  OpFOrdGreaterThanEqual = 190, OpBitwiseAnd = 199, OpSelectionMerge = 247,
+  OpFOrdGreaterThanEqual = 190, OpBitwiseAnd = 199, OpDPdx = 207, OpDPdy = 208, OpSelectionMerge = 247,
   OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpKill = 252, OpReturn = 253,
 };
 enum : uint32_t { SC_UniformConstant = 0, SC_Input = 1, SC_Uniform = 2, SC_Output = 3, SC_Function = 7 };
@@ -963,7 +963,8 @@ bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::
       case FP_STR: r = v1; break;
       case FP_FRC: r = ext(G_Fract, tv4, {a}); break;
       case FP_FLR: r = ext(G_Floor, tv4, {a}); break;
-      case FP_DDX: case FP_DDY: r = v0; break;  // matches the reference renderer
+      case FP_DDX: { const uint32_t d = m.id(); Module::emit(body, OpDPdx, {tv4, d, a}); r = d; break; }
+      case FP_DDY: { const uint32_t d = m.id(); Module::emit(body, OpDPdy, {tv4, d, a}); r = d; break; }
       case FP_TEX: case FP_TXD: r = sample(i, a, 0); break;
       case FP_TXP: r = sample(i, a, 1); break;
       case FP_TXL: r = sample(i, a, 2); break;
