@@ -113,16 +113,18 @@ Skate3-VK.exe <EBOOT.ELF> [--game-root <dir>] [--data <saves dir>] [--mods <dir>
 
 ---
 
-## Mods & Function Hooking
+## Mods & Mod SDK
 
-Every recompiled function is dispatched through a slot table, so hooking a guest address replaces it for every caller:
+Every recompiled function is dispatched through a slot table, so hooking a guest address replaces it for every caller.
 
-```cpp
-ppu::Fn original = ppu::hook_function(0x0012ABCD, my_function);  // in-process
-ppu::unhook_function(0x0012ABCD);
+Use the standalone **[CellForge Mod SDK](mod_sdk/README.md)** (`mod_sdk/`) to scaffold, build, and deploy native C++20 DLL mods in two commands:
+
+```powershell
+.\mod_sdk\tools\new_mod.ps1 -Name MySkateMod
+.\mod_sdk\tools\build_mod.ps1 -ModDir .\mod_sdk\mods_src\MySkateMod -DeployDir "$env:LOCALAPPDATA\Games\Skate3-VK\mods"
 ```
 
-Drop mod DLLs into the game's `mods/` folder. A mod exports `ps3recomp_mod_init(const Ps3RecompModApi*)` and uses `hook`, `unhook`, `call`, and `guest_base` (see [src/runtime/ppu_mod_api.h](src/runtime/ppu_mod_api.h) and [tests/example_mod.cpp](tests/example_mod.cpp)). Pass `--no-hooks` to `ps3recomp` to emit direct calls instead.
+The single-header SDK ([mod_sdk/include/cellforge_mod.h](mod_sdk/include/cellforge_mod.h)) provides `CELLFORGE_MOD_ENTRY`, RAII function hooking (`cellforge::Hook`), big-endian PS3 guest memory helpers, wildcard pattern scanning, and an `.ini` config reader. Drop compiled `.dll` files into the game's `mods/` folder to load them automatically on startup (or pass `--no-mods` to disable). Pass `--no-hooks` to `ps3recomp` to emit direct calls instead.
 
 ---
 
