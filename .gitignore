@@ -1,0 +1,33 @@
+# Build outputs & generated recompiled game code
+build/
+out/
+.vs/
+CMakeUserPresets.json
+
+# Compiled binaries, objects, debug symbols, maps
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.map
+*.ico
+
+# Logs, captures, profiler dumps
+*.err.txt
+*.out.txt
+*.prof.txt
+*.log
+*.bmp
+*.raw
+*.wav
+
+# Local user configs & saves
+builder.ini
+ps3game.ini
+Skate3-VK.ini
+cellforge.ini
+ps3_data/
+saves/
