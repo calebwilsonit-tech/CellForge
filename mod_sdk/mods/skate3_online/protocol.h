@@ -64,10 +64,17 @@ struct StatePacket {
   SkaterState state;
 };
 
+enum class EventKind : uint16_t {
+  Chat = 1,
+  MarkerTeleport = 2,
+  TrickCallout = 3,
+  PeerInfo = 4,  // Broadcasts player_name so relay/P2P peers know each other's names
+};
+
 struct EventPacket {
   Header hdr;
   char room[kRoomCodeLen]{};
-  uint16_t event_kind = 0;  // 1=chat, 2=marker_teleport, 3=trick_callout
+  uint16_t event_kind = 0;  // EventKind
   uint16_t payload_len = 0;
   char payload[128]{};
 };

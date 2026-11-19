@@ -90,6 +90,22 @@ def main():
             seq += 1
             sock.sendto(welcome, addr)
 
+            # Exchange PeerInfo (kind=4) so everyone in the room sees each other's names immediately.
+            room_bytes = room.encode("utf-8")[:8].ljust(8, b"\x00")
+            for other_addr, other_info in list(peers.items()):
+                if other_addr == addr:
+                    continue
+                # Tell newcomer about existing peer
+                ob = other_info["name"].encode("utf-8")[:127]
+                ep1 = struct.pack(HDR_FMT, MAGIC, VERSION, MSG_EVENT, other_info["peer_id"], seq, int(now * 1000) & 0xFFFFFFFF) + room_bytes + struct.pack("<HH", 4, len(ob)) + ob.ljust(128, b"\x00")
+                seq += 1
+                sock.sendto(ep1, addr)
+                # Tell existing peer about newcomer
+                nb = name.encode("utf-8")[:127]
+                ep2 = struct.pack(HDR_FMT, MAGIC, VERSION, MSG_EVENT, pid, seq, int(now * 1000) & 0xFFFFFFFF) + room_bytes + struct.pack("<HH", 4, len(nb)) + nb.ljust(128, b"\x00")
+                seq += 1
+                sock.sendto(ep2, other_addr)
+
         elif mtype == MSG_PING and len(data) >= HDR_SIZE + 8:
             pong = struct.pack(HDR_FMT, MAGIC, VERSION, MSG_PONG, 0, pseq, ts) + data[HDR_SIZE:]
             sock.sendto(pong, addr)

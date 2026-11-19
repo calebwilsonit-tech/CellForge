@@ -142,6 +142,11 @@ void NetClient::stop() {
   peer_id_ = 0;
 }
 
+void NetClient::set_event_callback(EventFn cb) {
+  std::lock_guard<std::mutex> lk(event_mu_);
+  event_cb_ = std::move(cb);
+}
+
 void NetClient::set_local_state(const SkaterState& st) {
   std::lock_guard<std::mutex> lk(state_mu_);
   local_state_ = st;
@@ -195,6 +200,7 @@ void NetClient::io_loop() {
   uint64_t last_state_us = 0;
   uint64_t last_hello_us = 0;
   uint64_t last_ping_us = 0;
+  uint64_t last_info_us = 0;
 
   uint8_t buf[1024];
   while (running_.load()) {
@@ -233,6 +239,12 @@ void NetClient::io_loop() {
       p.send_time_us = now;
       send_raw(&p, sizeof(p), target_ip_, target_port_);
       last_ping_us = now;
+    }
+
+    // 3b. Broadcast local player name periodically (every 4s) so late joiners learn our name.
+    if (peer_id_.load() != 0 && (now - last_info_us) >= 4000000ull) {
+      send_event(static_cast<uint16_t>(EventKind::PeerInfo), cfg_.player_name);
+      last_info_us = now;
     }
 
     // 4. Send local skater state at configured tick_hz.
@@ -320,6 +332,19 @@ void NetClient::handle_packet(const uint8_t* data, size_t len, uint32_t from_ip,
       wp.player_count = static_cast<uint8_t>(host_clients_.size() + 1);
       wp.tick_hz = cfg_.tick_hz;
       send_raw(&wp, sizeof(wp), from_ip, from_port);
+
+      // Immediately share host's name with the newly joined client.
+      EventPacket info{};
+      info.hdr.type = static_cast<uint8_t>(MsgType::Event);
+      info.hdr.peer_id = 1;
+      info.hdr.seq = seq_.fetch_add(1);
+      info.hdr.timestamp_ms = steady_ms();
+      copy_str(info.room, kRoomCodeLen, cfg_.room.c_str());
+      info.event_kind = static_cast<uint16_t>(EventKind::PeerInfo);
+      const size_t n = std::min(cfg_.player_name.size(), sizeof(info.payload) - 1);
+      info.payload_len = static_cast<uint16_t>(n);
+      std::memcpy(info.payload, cfg_.player_name.data(), n);
+      send_raw(&info, sizeof(info), from_ip, from_port);
     }
     return;
   }
@@ -331,6 +356,7 @@ void NetClient::handle_packet(const uint8_t* data, size_t len, uint32_t from_ip,
       peer_id_ = wp.assigned_peer_id;
       logf("connected! assigned peer_id=%u (players=%u, %u Hz)",
            unsigned(wp.assigned_peer_id), unsigned(wp.player_count), unsigned(wp.tick_hz));
+      send_event(static_cast<uint16_t>(EventKind::PeerInfo), cfg_.player_name);
     }
     return;
   }
@@ -385,7 +411,28 @@ void NetClient::handle_packet(const uint8_t* data, size_t len, uint32_t from_ip,
     std::memcpy(&ep, data, sizeof(ep));
     const size_t plen = std::min<size_t>(ep.payload_len, sizeof(ep.payload) - 1);
     std::string msg(ep.payload, plen);
-    logf("event(kind=%u, from=%u): %s", unsigned(ep.event_kind), unsigned(ep.hdr.peer_id), msg.c_str());
+
+    if (ep.event_kind == static_cast<uint16_t>(EventKind::PeerInfo) && ep.hdr.peer_id != 0 &&
+        ep.hdr.peer_id != peer_id_.load()) {
+      std::lock_guard<std::mutex> lk(peers_mu_);
+      PeerSnapshot& ps = peers_[ep.hdr.peer_id];
+      ps.peer_id = ep.hdr.peer_id;
+      if (!msg.empty()) ps.name = msg;
+      ps.curr_recv_us = now_us;
+      ps.active = true;
+    } else {
+      logf("event(kind=%u, from=%u): %s", unsigned(ep.event_kind), unsigned(ep.hdr.peer_id), msg.c_str());
+    }
+
+    {
+      EventFn cb;
+      {
+        std::lock_guard<std::mutex> lk(event_mu_);
+        cb = event_cb_;
+      }
+      if (cb) cb(ep.hdr.peer_id, ep.event_kind, msg);
+    }
+
     if (cfg_.mode == "host") {
       std::lock_guard<std::mutex> lk(peers_mu_);
       for (const auto& c : host_clients_) {
@@ -405,17 +452,42 @@ void NetClient::handle_packet(const uint8_t* data, size_t len, uint32_t from_ip,
   }
 }
 
+namespace {
+void nlerp_quat(const float a[4], const float b[4], float t, float out[4]) {
+  float dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
+  const float sign = (dot < 0.0f) ? -1.0f : 1.0f;
+  float len2 = 0.0f;
+  for (int i = 0; i < 4; ++i) {
+    out[i] = a[i] + t * (sign * b[i] - a[i]);
+    len2 += out[i] * out[i];
+  }
+  if (len2 > 1e-8f) {
+    const float inv = 1.0f / std::sqrt(len2);
+    for (int i = 0; i < 4; ++i) out[i] *= inv;
+  } else {
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+  }
+}
+}  // namespace
+
 SkaterState NetClient::interpolate(const PeerSnapshot& peer, uint64_t now_us) {
   if (!peer.active || peer.curr_recv_us <= peer.prev_recv_us) return peer.curr_state;
   const double dt = static_cast<double>(peer.curr_recv_us - peer.prev_recv_us);
   const double elapsed = (now_us > peer.curr_recv_us) ? static_cast<double>(now_us - peer.curr_recv_us) : 0.0;
-  // Blend between prev and curr, clamping small extrapolation to 100ms max.
-  const double t = std::clamp(elapsed / std::max(dt, 1000.0), 0.0, 1.0);
+  const float t = static_cast<float>(std::clamp(elapsed / std::max(dt, 1000.0), 0.0, 1.0));
   SkaterState out = peer.curr_state;
   for (int i = 0; i < 3; ++i) {
-    out.pos[i] = peer.prev_state.pos[i] + static_cast<float>(t) * (peer.curr_state.pos[i] - peer.prev_state.pos[i]);
-    out.vel[i] = peer.prev_state.vel[i] + static_cast<float>(t) * (peer.curr_state.vel[i] - peer.prev_state.vel[i]);
+    out.pos[i] = peer.prev_state.pos[i] + t * (peer.curr_state.pos[i] - peer.prev_state.pos[i]);
+    out.vel[i] = peer.prev_state.vel[i] + t * (peer.curr_state.vel[i] - peer.prev_state.vel[i]);
   }
+  // Gentle velocity dead-reckoning if a packet is slightly late (clamped to 50ms).
+  if (elapsed > dt) {
+    const float extra_s = static_cast<float>(std::min((elapsed - dt) * 1e-6, 0.05));
+    for (int i = 0; i < 3; ++i) out.pos[i] += out.vel[i] * extra_s;
+  }
+  nlerp_quat(peer.prev_state.quat, peer.curr_state.quat, t, out.quat);
+  nlerp_quat(peer.prev_state.board_quat, peer.curr_state.board_quat, t, out.board_quat);
   return out;
 }
 

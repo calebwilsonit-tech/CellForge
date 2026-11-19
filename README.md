@@ -124,7 +124,12 @@ Use the standalone **[CellForge Mod SDK](mod_sdk/README.md)** (`mod_sdk/`) to sc
 .\mod_sdk\tools\build_mod.ps1 -ModDir .\mod_sdk\mods_src\MySkateMod -DeployDir "$env:LOCALAPPDATA\Games\Skate3-VK\mods"
 ```
 
-The single-header SDK ([mod_sdk/include/cellforge_mod.h](mod_sdk/include/cellforge_mod.h)) provides `CELLFORGE_MOD_ENTRY`, RAII function hooking (`cellforge::Hook`), big-endian PS3 guest memory helpers, wildcard pattern scanning, and an `.ini` config reader. Drop compiled `.dll` files into the game's `mods/` folder to load them automatically on startup (or pass `--no-mods` to disable). Pass `--no-hooks` to `ps3recomp` to emit direct calls instead.
+The single-header SDK ([mod_sdk/include/cellforge_mod.h](mod_sdk/include/cellforge_mod.h)) provides `CELLFORGE_MOD_ENTRY`, RAII function hooking (`cellforge::Hook`), big-endian PS3 guest memory helpers, wildcard pattern scanning, and an `.ini` config reader. Drop compiled `.dll` files into the game's `mods/` folder to load them automatically on startup, and toggle or configure them from the in-game **Settings → Mods** menu (`F1`). Pass `--no-mods` to disable mods or `--no-hooks` to `ps3recomp` to emit direct calls.
+
+### Included Mods (`mod_sdk/mods/`)
+- **`skate3_online`** — Native Winsock2 UDP multiplayer mod (Direct P2P `host`/`join` or `relay_server.py` room codes) with 60 Hz skater kinematics, quaternion NLERP interpolation, and an in-game **`F6`** dark-mode Lobby & Chat panel.
+- **`skate3_trick_timer`** — Draggable, always-on-top **`F7`** Speedrun Split Timer & Line Tracker HUD (`F8` Split, `F9` Pause, `F10` Reset) with automatic Personal Best (`PB`) deltas.
+- **`skate3_clip_studio`** — Instant lossless PNG screenshot (`F12`), trick-sequence burst mode (`F11`), and **`F5`** Clip Studio control panel saving directly to `%USERPROFILE%\Pictures\Skate3-VK\`.
 
 ---
 

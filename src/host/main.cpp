@@ -113,9 +113,9 @@ void auto_discover(ppu::BootOptions& opt) {
 
 int main(int argc, char** argv) {
   // Load user graphics/audio options from options.ini next to the executable.
+  std::filesystem::path exe_dir = std::filesystem::current_path();
   {
     namespace fs = std::filesystem;
-    fs::path exe_dir = fs::current_path();
 #if defined(_WIN32)
     wchar_t buf[MAX_PATH] = {};
     if (GetModuleFileNameW(nullptr, buf, MAX_PATH)) exe_dir = fs::path(buf).parent_path();
@@ -126,15 +126,17 @@ int main(int argc, char** argv) {
   }
 
   ppu::BootOptions opt;
-  opt.mods_dir = "mods";
+  opt.mods_dir = (exe_dir / "mods").string();
   bool open_settings = false;
+  bool want_console = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--settings") open_settings = true;
+    else if (a == "--console") want_console = true;
     else if (a == "--mods" && i + 1 < argc) opt.mods_dir = argv[++i];
     else if (a == "--no-mods") opt.mods_dir.clear();
     else if (a == "--strict") opt.strict = true;
-    else if (a == "--headless") opt.headless = true;
+    else if (a == "--headless") { opt.headless = true; want_console = true; }
     else if (a == "--cpu-render") opt.gpu_render = false;
     else if (a == "--game-root" && i + 1 < argc) opt.game_root = argv[++i];
     else if (a == "--data" && i + 1 < argc) opt.data_root = argv[++i];
@@ -144,6 +146,18 @@ int main(int argc, char** argv) {
     else if (opt.elf_path.empty()) opt.elf_path = a;
     else { std::fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
   }
+#if defined(_WIN32)
+  // Because the game uses /SUBSYSTEM:WINDOWS (no idle CMD window on launch),
+  // attach to a parent console only when explicitly running --headless or --console
+  // and stdout/stderr are not already redirected to a file/pipe.
+  if (want_console && GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_UNKNOWN) {
+    if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+      FILE* f = nullptr;
+      freopen_s(&f, "CONOUT$", "w", stdout);
+      freopen_s(&f, "CONOUT$", "w", stderr);
+    }
+  }
+#endif
   if (open_settings) {
     cfg::show_settings_dialog(cfg::ini_path());
     return 0;

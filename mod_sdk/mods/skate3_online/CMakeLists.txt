@@ -13,7 +13,7 @@ cellforge_add_mod(skate3_online
   net_client.cpp
 )
 if(WIN32)
-  target_link_libraries(skate3_online PRIVATE ws2_32)
+  target_link_libraries(skate3_online PRIVATE ws2_32 user32 gdi32)
 endif()
 
 # Standalone UDP loopback test executable

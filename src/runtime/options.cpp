@@ -1,8 +1,10 @@
 #include "options.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 
 namespace cfg {
 
@@ -29,7 +31,28 @@ std::string trim(std::string s) {
   return s.substr(i);
 }
 
+std::string to_lower_ascii(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
 }  // namespace
+
+bool Options::is_mod_disabled(const std::string& filename) const {
+  const std::string target = to_lower_ascii(filename);
+  for (const auto& m : disabled_mods) {
+    if (to_lower_ascii(m) == target) return true;
+  }
+  return false;
+}
+
+void Options::set_mod_disabled(const std::string& filename, bool disabled) {
+  const std::string target = to_lower_ascii(filename);
+  disabled_mods.erase(std::remove_if(disabled_mods.begin(), disabled_mods.end(),
+                                     [&](const std::string& m) { return to_lower_ascii(m) == target; }),
+                      disabled_mods.end());
+  if (disabled && !filename.empty()) disabled_mods.push_back(filename);
+}
 
 void Options::apply_preset(int preset) {
   quality_preset = std::clamp(preset, 0, 4);
@@ -104,6 +127,15 @@ bool load(const std::filesystem::path& file, Options& out) {
     else if (k == "fps_counter") out.fps_counter = iv != 0;
     else if (k == "volume") out.volume = std::clamp(iv, 0, 100);
     else if (k == "mute_in_background") out.mute_in_background = iv != 0;
+    else if (k == "disabled_mods") {
+      out.disabled_mods.clear();
+      std::stringstream ss(v);
+      std::string item;
+      while (std::getline(ss, item, ',')) {
+        item = trim(item);
+        if (!item.empty()) out.disabled_mods.push_back(item);
+      }
+    }
   }
   return true;
 }
@@ -127,6 +159,12 @@ bool save(const std::filesystem::path& file, const Options& o) {
   f << "fps_counter=" << (o.fps_counter ? 1 : 0) << "\n";
   f << "volume=" << o.volume << "\n";
   f << "mute_in_background=" << (o.mute_in_background ? 1 : 0) << "\n";
+  f << "disabled_mods=";
+  for (size_t i = 0; i < o.disabled_mods.size(); ++i) {
+    if (i) f << ",";
+    f << o.disabled_mods[i];
+  }
+  f << "\n";
   return f.good();
 }
 

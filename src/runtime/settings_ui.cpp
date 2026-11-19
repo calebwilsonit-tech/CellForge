@@ -1,20 +1,28 @@
 #include "settings_ui.h"
 #include "options.h"
+#include "ppu_mod_api.h"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <filesystem>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace cfg {
 namespace {
 
 enum : int {
+  ID_TAB_GFX = 190,
+  ID_TAB_MODS = 191,
+
   ID_PRESET = 201,
   ID_DISPLAY_MODE,
   ID_RES,
@@ -26,7 +34,14 @@ enum : int {
   ID_FPS_COUNTER,
   ID_VOLUME,
   ID_MUTE_BG,
-  ID_APPLY,
+
+  ID_MOD_LIST = 250,
+  ID_MOD_TOGGLE,
+  ID_MOD_EDIT_INI,
+  ID_MOD_OPEN_DIR,
+  ID_MOD_REFRESH,
+
+  ID_APPLY = 280,
   ID_RESET,
   ID_CLOSE,
 };
@@ -37,6 +52,7 @@ constexpr COLORREF kText = RGB(229, 233, 240);
 constexpr COLORREF kMuted = RGB(148, 163, 184);
 constexpr COLORREF kAccent = RGB(37, 99, 235);
 constexpr COLORREF kGreen = RGB(16, 185, 129);
+constexpr COLORREF kAmber = RGB(217, 119, 6);
 constexpr COLORREF kSlate = RGB(51, 65, 85);
 
 struct ResEntry {
@@ -54,18 +70,57 @@ constexpr int kAfVals[] = {1, 2, 4, 8, 16};
 constexpr int kFpsVals[] = {30, 60, 120, 0};
 constexpr int kVolVals[] = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100};
 
+struct ModEntry {
+  std::string filename;
+  std::filesystem::path dll_path;
+  std::filesystem::path ini_path;
+  bool has_ini = false;
+  bool runtime_loaded = false;
+  std::string runtime_detail;
+};
+
 struct DialogState {
   std::filesystem::path ini;
+  std::filesystem::path mods_dir;
   Options opt;
   bool saved = false;
   bool updating = false;
+  int active_tab = 0;  // 0 = Graphics & Audio, 1 = Mods
   HWND hwnd = nullptr;
+
+  // Tab buttons
+  HWND b_tab_gfx = nullptr, b_tab_mods = nullptr;
+
+  // Graphics & Audio controls
+  std::vector<HWND> gfx_ctrls;
   HWND c_preset = nullptr, c_disp = nullptr, c_res = nullptr, c_vsync = nullptr, c_fps = nullptr;
   HWND c_af = nullptr, c_upscale = nullptr, c_mips = nullptr, c_fps_cnt = nullptr;
-  HWND c_vol = nullptr, c_mute = nullptr, c_hint = nullptr;
-  HFONT f_ui = nullptr, f_bold = nullptr, f_hdr = nullptr;
+  HWND c_vol = nullptr, c_mute = nullptr;
+
+  // Mods tab controls
+  std::vector<HWND> mod_ctrls;
+  std::vector<ModEntry> mods;
+  HWND c_mod_hdr = nullptr, c_mod_list = nullptr, c_mod_info = nullptr;
+  HWND b_mod_toggle = nullptr, b_mod_ini = nullptr, b_mod_open = nullptr, b_mod_refresh = nullptr;
+
+  // Shared bottom controls
+  HWND c_hint = nullptr;
+  HFONT f_ui = nullptr, f_bold = nullptr, f_hdr = nullptr, f_mono = nullptr;
   HBRUSH br_bg = nullptr, br_card = nullptr;
 };
+
+std::wstring widen(const std::string& s) {
+  if (s.empty()) return {};
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), nullptr, 0);
+  std::wstring out(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.c_str(), int(s.size()), out.data(), n);
+  return out;
+}
+
+std::string to_lower_ascii(std::string s) {
+  for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
 
 void enable_dark_bar(HWND hwnd) {
   if (HMODULE dwm = LoadLibraryW(L"dwmapi.dll")) {
@@ -76,6 +131,81 @@ void enable_dark_bar(HWND hwnd) {
     }
     FreeLibrary(dwm);
   }
+}
+
+void refresh_mods_list(DialogState& s) {
+  const int prev_sel = int(SendMessageW(s.c_mod_list, LB_GETCURSEL, 0, 0));
+  SendMessageW(s.c_mod_list, LB_RESETCONTENT, 0, 0);
+  s.mods.clear();
+
+  const auto runtime_list = ppu::get_mod_status_list();
+  std::error_code ec;
+  if (!s.mods_dir.empty() && std::filesystem::exists(s.mods_dir, ec)) {
+    for (const auto& entry : std::filesystem::directory_iterator(s.mods_dir, ec)) {
+      if (!entry.is_regular_file(ec)) continue;
+      const auto ext = to_lower_ascii(entry.path().extension().string());
+      if (ext != ".dll") continue;
+      ModEntry m;
+      m.dll_path = entry.path();
+      m.filename = entry.path().filename().string();
+      m.ini_path = entry.path();
+      m.ini_path.replace_extension(".ini");
+      m.has_ini = std::filesystem::exists(m.ini_path, ec);
+      for (const auto& rs : runtime_list) {
+        if (to_lower_ascii(rs.filename) == to_lower_ascii(m.filename)) {
+          m.runtime_loaded = rs.loaded;
+          m.runtime_detail = rs.detail;
+          break;
+        }
+      }
+      s.mods.push_back(std::move(m));
+    }
+  }
+  std::sort(s.mods.begin(), s.mods.end(),
+            [](const ModEntry& a, const ModEntry& b) { return to_lower_ascii(a.filename) < to_lower_ascii(b.filename); });
+
+  if (s.mods.empty()) {
+    SendMessageW(s.c_mod_list, LB_ADDSTRING, 0, LPARAM(L"  (No .dll mods found in mods/ folder)"));
+    SetWindowTextW(s.c_mod_info, L"Drop any CellForge mod .dll into the mods/ folder and click Refresh.");
+    return;
+  }
+
+  for (const auto& m : s.mods) {
+    const bool disabled = s.opt.is_mod_disabled(m.filename);
+    std::wstring line;
+    if (disabled) {
+      line = L"[OFF]  ";
+    } else if (m.runtime_loaded) {
+      line = L"[ON *] ";
+    } else {
+      line = L"[ON]   ";
+    }
+    line += widen(m.filename);
+    if (m.has_ini) line += L"   (.ini)";
+    if (!disabled && m.runtime_loaded) line += L"  — active";
+    else if (disabled) line += L"  — disabled";
+    SendMessageW(s.c_mod_list, LB_ADDSTRING, 0, LPARAM(line.c_str()));
+  }
+
+  const int sel = (prev_sel >= 0 && prev_sel < int(s.mods.size())) ? prev_sel : 0;
+  SendMessageW(s.c_mod_list, LB_SETCURSEL, sel, 0);
+  const auto& cur = s.mods[size_t(sel)];
+  std::wstring info = L"File: " + widen(cur.filename) + (cur.has_ini ? L"  |  Config: " + cur.ini_path.filename().wstring() : L"  |  No .ini config");
+  SetWindowTextW(s.c_mod_info, info.c_str());
+}
+
+void switch_tab(DialogState& s, int tab) {
+  s.active_tab = tab;
+  for (HWND h : s.gfx_ctrls) ShowWindow(h, tab == 0 ? SW_SHOW : SW_HIDE);
+  for (HWND h : s.mod_ctrls) ShowWindow(h, tab == 1 ? SW_SHOW : SW_HIDE);
+  if (tab == 1) {
+    refresh_mods_list(s);
+    SetWindowTextW(s.c_hint, L"Double-click a mod to toggle it. Click Save & Apply (takes effect next launch).");
+  } else {
+    SetWindowTextW(s.c_hint, L"Tip: Press F1 in-game to open Settings, Alt+Enter to toggle Fullscreen.");
+  }
+  InvalidateRect(s.b_tab_gfx, nullptr, TRUE);
+  InvalidateRect(s.b_tab_mods, nullptr, TRUE);
 }
 
 void push_to_controls(DialogState& s) {
@@ -139,7 +269,11 @@ HWND mk(HWND parent, HFONT font, const wchar_t* cls, const wchar_t* text, DWORD 
 void draw_btn(const DialogState& s, const DRAWITEMSTRUCT* dis) {
   COLORREF col = kSlate;
   if (dis->CtlID == ID_APPLY) col = kGreen;
-  else if (dis->CtlID == ID_RESET) col = kAccent;
+  else if (dis->CtlID == ID_RESET || dis->CtlID == ID_MOD_TOGGLE) col = kAccent;
+  else if (dis->CtlID == ID_MOD_EDIT_INI) col = kAmber;
+  else if (dis->CtlID == ID_TAB_GFX) col = (s.active_tab == 0) ? kAccent : kCard;
+  else if (dis->CtlID == ID_TAB_MODS) col = (s.active_tab == 1) ? kAccent : kCard;
+
   if (dis->itemState & ODS_SELECTED)
     col = RGB(std::max(0, int(GetRValue(col)) - 25), std::max(0, int(GetGValue(col)) - 25),
               std::max(0, int(GetBValue(col)) - 25));
@@ -155,6 +289,18 @@ void draw_btn(const DialogState& s, const DRAWITEMSTRUCT* dis) {
   DrawTextW(dis->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+void toggle_selected_mod(DialogState& s) {
+  const int sel = int(SendMessageW(s.c_mod_list, LB_GETCURSEL, 0, 0));
+  if (sel < 0 || sel >= int(s.mods.size())) return;
+  const std::string& name = s.mods[size_t(sel)].filename;
+  const bool now_disabled = !s.opt.is_mod_disabled(name);
+  s.opt.set_mod_disabled(name, now_disabled);
+  refresh_mods_list(s);
+  SendMessageW(s.c_mod_list, LB_SETCURSEL, sel, 0);
+  const std::wstring msg = widen(name) + (now_disabled ? L" marked OFF — click Save & Apply." : L" marked ON — click Save & Apply.");
+  SetWindowTextW(s.c_hint, msg.c_str());
+}
+
 LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
   auto* s = reinterpret_cast<DialogState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
   switch (msg) {
@@ -168,17 +314,30 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       s->f_ui = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
       s->f_bold = CreateFontW(-14, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
       s->f_hdr = CreateFontW(-16, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, VARIABLE_PITCH, L"Segoe UI");
+      s->f_mono = CreateFontW(-14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
       s->br_bg = CreateSolidBrush(kBg);
       s->br_card = CreateSolidBrush(kCard);
 
       const int lx = 20, lw = 195, cx = 225, cw = 250;
-      int y = 16;
-      mk(hwnd, s->f_hdr, L"STATIC", L"Display && Graphics Settings", 0, lx, y, 440, 24);
-      y += 34;
+
+      // Top Tab Bar
+      s->b_tab_gfx = mk(hwnd, s->f_bold, L"BUTTON", L"Graphics && Audio", BS_OWNERDRAW | WS_TABSTOP, lx, 14, 224, 32, ID_TAB_GFX);
+      s->b_tab_mods = mk(hwnd, s->f_bold, L"BUTTON", L"Mods", BS_OWNERDRAW | WS_TABSTOP, lx + 231, 14, 224, 32, ID_TAB_MODS);
+
+      // ---- Tab 0: Graphics & Audio ----
+      auto mk_gfx = [&](HFONT font, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id = 0) -> HWND {
+        HWND c = mk(hwnd, font, cls, text, style, x, y, w, h, id);
+        s->gfx_ctrls.push_back(c);
+        return c;
+      };
+
+      int y = 58;
+      mk_gfx(s->f_hdr, L"STATIC", L"Display && Graphics Settings", 0, lx, y, 440, 24);
+      y += 32;
 
       auto add_combo = [&](const wchar_t* label, int id) -> HWND {
-        mk(hwnd, s->f_ui, L"STATIC", label, 0, lx, y + 4, lw, 20);
-        HWND cb = mk(hwnd, s->f_ui, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, cx, y, cw, 220, id);
+        mk_gfx(s->f_ui, L"STATIC", label, 0, lx, y + 4, lw, 20);
+        HWND cb = mk_gfx(s->f_ui, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, cx, y, cw, 220, id);
         y += 34;
         return cb;
       };
@@ -212,31 +371,50 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SendMessageW(s->c_upscale, CB_ADDSTRING, 0, LPARAM(L"Nearest (Crisp Pixels)"));
       SendMessageW(s->c_upscale, CB_ADDSTRING, 0, LPARAM(L"Linear (Smooth)"));
 
-      s->c_mips = mk(hwnd, s->f_ui, L"BUTTON", L"Enable GPU Mipmaps && Trilinear Filtering (eliminates ground grain)",
-                     BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_MIPMAPS);
+      s->c_mips = mk_gfx(s->f_ui, L"BUTTON", L"Enable GPU Mipmaps && Trilinear Filtering (eliminates ground grain)",
+                         BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_MIPMAPS);
       y += 28;
-      s->c_fps_cnt = mk(hwnd, s->f_ui, L"BUTTON", L"Show live FPS counter in window title bar",
-                        BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_FPS_COUNTER);
-      y += 34;
+      s->c_fps_cnt = mk_gfx(s->f_ui, L"BUTTON", L"Show live FPS counter in window title bar",
+                            BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_FPS_COUNTER);
+      y += 32;
 
-      mk(hwnd, s->f_hdr, L"STATIC", L"Audio", 0, lx, y, 440, 22);
-      y += 30;
+      mk_gfx(s->f_hdr, L"STATIC", L"Audio", 0, lx, y, 440, 22);
+      y += 28;
       s->c_vol = add_combo(L"Master Volume:", ID_VOLUME);
       for (int v : kVolVals) {
         std::wstring lbl = std::to_wstring(v) + L"%";
         SendMessageW(s->c_vol, CB_ADDSTRING, 0, LPARAM(lbl.c_str()));
       }
-      s->c_mute = mk(hwnd, s->f_ui, L"BUTTON", L"Mute audio when window is in background",
-                     BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_MUTE_BG);
-      y += 32;
+      s->c_mute = mk_gfx(s->f_ui, L"BUTTON", L"Mute audio when window is in background",
+                         BS_AUTOCHECKBOX | WS_TABSTOP, lx, y, 455, 22, ID_MUTE_BG);
 
+      // ---- Tab 1: Mods ----
+      auto mk_mod = [&](HFONT font, const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y_, int w, int h, int id = 0) -> HWND {
+        HWND c = mk(hwnd, font, cls, text, style, x, y_, w, h, id);
+        ShowWindow(c, SW_HIDE);
+        s->mod_ctrls.push_back(c);
+        return c;
+      };
+
+      s->c_mod_hdr = mk_mod(s->f_hdr, L"STATIC", L"Installed Mods (mods/)", 0, lx, 58, 455, 24);
+      s->c_mod_list = mk_mod(s->f_mono, L"LISTBOX", L"",
+                             WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
+                             lx, 90, 455, 310, ID_MOD_LIST);
+      s->c_mod_info = mk_mod(s->f_ui, L"STATIC", L"", 0, lx, 410, 455, 22);
+
+      s->b_mod_toggle = mk_mod(s->f_bold, L"BUTTON", L"Toggle On / Off", BS_OWNERDRAW | WS_TABSTOP, lx, 442, 145, 32, ID_MOD_TOGGLE);
+      s->b_mod_ini = mk_mod(s->f_bold, L"BUTTON", L"Edit Config (.ini)", BS_OWNERDRAW | WS_TABSTOP, lx + 155, 442, 145, 32, ID_MOD_EDIT_INI);
+      s->b_mod_open = mk_mod(s->f_bold, L"BUTTON", L"Open Folder", BS_OWNERDRAW | WS_TABSTOP, lx + 310, 442, 145, 32, ID_MOD_OPEN_DIR);
+      s->b_mod_refresh = mk_mod(s->f_bold, L"BUTTON", L"Refresh Mods List", BS_OWNERDRAW | WS_TABSTOP, lx, 482, 455, 30, ID_MOD_REFRESH);
+
+      // ---- Shared Footer ----
+      const int footer_y = 532;
       s->c_hint = mk(hwnd, s->f_ui, L"STATIC", L"Tip: Press F1 in-game to open Settings, Alt+Enter to toggle Fullscreen.",
-                     0, lx, y, 455, 20);
-      y += 30;
+                     0, lx, footer_y, 455, 20);
 
-      mk(hwnd, s->f_bold, L"BUTTON", L"Save && Apply", BS_OWNERDRAW | WS_TABSTOP, lx, y, 145, 34, ID_APPLY);
-      mk(hwnd, s->f_bold, L"BUTTON", L"Reset Defaults", BS_OWNERDRAW | WS_TABSTOP, lx + 155, y, 135, 34, ID_RESET);
-      mk(hwnd, s->f_bold, L"BUTTON", L"Close", BS_OWNERDRAW | WS_TABSTOP, lx + 300, y, 155, 34, ID_CLOSE);
+      mk(hwnd, s->f_bold, L"BUTTON", L"Save && Apply", BS_OWNERDRAW | WS_TABSTOP, lx, footer_y + 28, 145, 34, ID_APPLY);
+      mk(hwnd, s->f_bold, L"BUTTON", L"Reset Defaults", BS_OWNERDRAW | WS_TABSTOP, lx + 155, footer_y + 28, 135, 34, ID_RESET);
+      mk(hwnd, s->f_bold, L"BUTTON", L"Close", BS_OWNERDRAW | WS_TABSTOP, lx + 300, footer_y + 28, 155, 34, ID_CLOSE);
 
       push_to_controls(*s);
       return 0;
@@ -246,7 +424,8 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (!s) break;
       HDC hdc = HDC(wp);
       SetBkColor(hdc, kBg);
-      SetTextColor(hdc, HWND(lp) == s->c_hint ? kMuted : kText);
+      const bool muted = (HWND(lp) == s->c_hint || HWND(lp) == s->c_mod_info);
+      SetTextColor(hdc, muted ? kMuted : kText);
       return LRESULT(s->br_bg);
     }
     case WM_CTLCOLORLISTBOX:
@@ -264,7 +443,11 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (!s) break;
       const int id = LOWORD(wp);
       const int code = HIWORD(wp);
-      if (id == ID_PRESET && code == CBN_SELCHANGE && !s->updating) {
+      if (id == ID_TAB_GFX) {
+        switch_tab(*s, 0);
+      } else if (id == ID_TAB_MODS) {
+        switch_tab(*s, 1);
+      } else if (id == ID_PRESET && code == CBN_SELCHANGE && !s->updating) {
         const int p = int(SendMessageW(s->c_preset, CB_GETCURSEL, 0, 0));
         if (p >= 0 && p <= 3) {
           s->opt.apply_preset(p);
@@ -273,17 +456,46 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       } else if ((id == ID_RES || id == ID_VSYNC || id == ID_FPS_CAP || id == ID_AF || id == ID_UPSCALE || id == ID_MIPMAPS) &&
                  (code == CBN_SELCHANGE || code == BN_CLICKED) && !s->updating) {
         SendMessageW(s->c_preset, CB_SETCURSEL, 4 /*Custom*/, 0);
+      } else if (id == ID_MOD_LIST && code == LBN_SELCHANGE) {
+        const int sel = int(SendMessageW(s->c_mod_list, LB_GETCURSEL, 0, 0));
+        if (sel >= 0 && sel < int(s->mods.size())) {
+          const auto& cur = s->mods[size_t(sel)];
+          std::wstring info = L"File: " + widen(cur.filename) +
+                              (cur.has_ini ? L"  |  Config: " + cur.ini_path.filename().wstring() : L"  |  No .ini config");
+          SetWindowTextW(s->c_mod_info, info.c_str());
+        }
+      } else if ((id == ID_MOD_LIST && code == LBN_DBLCLK) || id == ID_MOD_TOGGLE) {
+        toggle_selected_mod(*s);
+      } else if (id == ID_MOD_EDIT_INI) {
+        const int sel = int(SendMessageW(s->c_mod_list, LB_GETCURSEL, 0, 0));
+        if (sel >= 0 && sel < int(s->mods.size())) {
+          const auto& cur = s->mods[size_t(sel)];
+          if (cur.has_ini) {
+            ShellExecuteW(hwnd, L"open", cur.ini_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          } else {
+            SetWindowTextW(s->c_hint, L"This mod does not have a matching .ini file in mods/.");
+          }
+        }
+      } else if (id == ID_MOD_OPEN_DIR) {
+        std::error_code ec;
+        std::filesystem::create_directories(s->mods_dir, ec);
+        ShellExecuteW(hwnd, L"open", s->mods_dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+      } else if (id == ID_MOD_REFRESH) {
+        refresh_mods_list(*s);
+        SetWindowTextW(s->c_hint, L"Mods list refreshed.");
       } else if (id == ID_APPLY) {
         pull_from_controls(*s);
         cfg::get() = s->opt;
         cfg::sync_atomics(s->opt);
         if (!s->ini.empty()) cfg::save(s->ini, s->opt);
         s->saved = true;
-        SetWindowTextW(s->c_hint, L"Settings saved and applied!");
+        SetWindowTextW(s->c_hint, s->active_tab == 1 ? L"Mod settings saved! Restart game to apply mod changes."
+                                                     : L"Settings saved and applied!");
       } else if (id == ID_RESET) {
         s->opt = Options{};
         s->opt.apply_preset(2);
         push_to_controls(*s);
+        if (s->active_tab == 1) refresh_mods_list(*s);
         SetWindowTextW(s->c_hint, L"Defaults restored — click Save & Apply to confirm.");
       } else if (id == ID_CLOSE) {
         DestroyWindow(hwnd);
@@ -298,6 +510,7 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         DeleteObject(s->f_ui);
         DeleteObject(s->f_bold);
         DeleteObject(s->f_hdr);
+        DeleteObject(s->f_mono);
         DeleteObject(s->br_bg);
         DeleteObject(s->br_card);
       }
@@ -314,6 +527,9 @@ std::atomic<bool> g_async_open{false};
 bool show_settings_dialog(const std::filesystem::path& options_ini, void* owner_hwnd) {
   DialogState st;
   st.ini = options_ini;
+  st.mods_dir = (!options_ini.empty() && options_ini.has_parent_path())
+                    ? (options_ini.parent_path() / "mods")
+                    : std::filesystem::path("mods");
   st.opt = cfg::get();
   if (!options_ini.empty()) cfg::load(options_ini, st.opt);
 
@@ -327,12 +543,12 @@ bool show_settings_dialog(const std::filesystem::path& options_ini, void* owner_
   wc.lpszClassName = kCls;
   RegisterClassExW(&wc);
 
-  const int W = 515, H = 600;
+  const int W = 515, H = 640;
   RECT area{};
   SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
   const int x = (area.left + area.right - W) / 2;
   const int y = (area.top + area.bottom - H) / 2;
-  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kCls, L"CellForge — Graphics & Audio Settings",
+  HWND hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, kCls, L"CellForge — Settings & Mods",
                               WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                               x, y, W, H, static_cast<HWND>(owner_hwnd), nullptr, inst, &st);
   if (!hwnd) return false;

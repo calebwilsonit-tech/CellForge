@@ -66,7 +66,7 @@ add_library(ps3_runtime STATIC
   src/runtime/hle_savedata.cpp src/runtime/profiler.cpp src/runtime/hid_pad.cpp
   src/runtime/options.cpp src/runtime/settings_ui.cpp)
 if(WIN32)
-  target_link_libraries(ps3_runtime PUBLIC ole32)
+  target_link_libraries(ps3_runtime PUBLIC ole32 shell32)
 endif()
 target_include_directories(ps3_runtime PUBLIC src/runtime)
 target_link_libraries(ps3_runtime PUBLIC ps3_elf ps3_gfx ps3_spu Threads::Threads PRIVATE ps3_vulkan_headers)
@@ -126,7 +126,11 @@ if(PS3RECOMP_GAME_DIR)
   set_target_properties(ps3game PROPERTIES OUTPUT_NAME "${PS3RECOMP_GAME_NAME}")
   target_link_libraries(ps3game PRIVATE ps3_runtime)
   if(MSVC)
-    target_link_options(ps3game PRIVATE /MAP)  # ps3game.map: host crash offsets -> fn_XXXXXXXX
+    # Windows GUI subsystem so launching the game doesn't pop up an idle CMD window,
+    # while keeping main(argc, argv) for CLI / --headless / --console usage.
+    target_link_options(ps3game PRIVATE /MAP /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+  elseif(WIN32)
+    set_target_properties(ps3game PROPERTIES WIN32_EXECUTABLE TRUE)
   endif()
 endif()
 

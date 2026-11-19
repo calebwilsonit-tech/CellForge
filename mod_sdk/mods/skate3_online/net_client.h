@@ -38,12 +38,15 @@ struct ClientConfig {
 class NetClient {
  public:
   using LogFn = std::function<void(const std::string&)>;
+  using EventFn = std::function<void(uint8_t peer_id, uint16_t kind, const std::string& payload)>;
 
   NetClient() = default;
   ~NetClient() { stop(); }
 
   bool start(const ClientConfig& cfg, LogFn log = nullptr);
   void stop();
+
+  void set_event_callback(EventFn cb);
 
   // Thread-safe: call from the game loop to publish local skater state.
   void set_local_state(const SkaterState& st);
@@ -54,13 +57,14 @@ class NetClient {
   // Sends a short text/event packet (e.g. session marker or trick callout).
   void send_event(uint16_t kind, const std::string& payload);
 
+  ClientConfig config() const { return cfg_; }
   bool running() const { return running_.load(); }
   uint8_t local_peer_id() const { return peer_id_.load(); }
   uint32_t rtt_ms() const { return rtt_ms_.load(); }
   uint64_t packets_sent() const { return tx_count_.load(); }
   uint64_t packets_recv() const { return rx_count_.load(); }
 
-  // Linearly interpolates between prev_state and curr_state for smooth rendering.
+  // Smoothly interpolates pos, vel, and quaternions between prev_state and curr_state.
   static SkaterState interpolate(const PeerSnapshot& peer, uint64_t now_us);
 
  private:
@@ -71,6 +75,8 @@ class NetClient {
 
   ClientConfig cfg_;
   LogFn log_;
+  mutable std::mutex event_mu_;
+  EventFn event_cb_;
   uintptr_t sock_ = ~uintptr_t(0);
   uint32_t target_ip_ = 0;
   uint16_t target_port_ = 0;

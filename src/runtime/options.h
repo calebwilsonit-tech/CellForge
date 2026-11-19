@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace cfg {
 
@@ -23,8 +24,11 @@ struct Options {
   bool fps_counter = true;         // Show live FPS in window title
   int volume = 100;                // 0..100
   bool mute_in_background = false; // Mute audio when game window is unfocused
+  std::vector<std::string> disabled_mods;  // Mod DLL filenames disabled via Settings -> Mods
 
   void apply_preset(int preset);
+  bool is_mod_disabled(const std::string& filename) const;
+  void set_mod_disabled(const std::string& filename, bool disabled);
 };
 
 // Global active options + live change notification (called when user clicks Apply).

@@ -20,6 +20,8 @@
 //   }
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "ppu_runtime.h"
 
@@ -42,8 +44,19 @@ struct Ps3RecompModApi {
 
 namespace ppu {
 
-// Loads every mod library in `dir` and calls its init function. Returns the number
+struct ModStatus {
+  std::string filename;
+  std::string path;
+  bool loaded = false;
+  bool disabled = false;
+  std::string detail;
+};
+
+// Loads every enabled mod library in `dir` and calls its init function. Returns the number
 // of mods that initialised successfully. Errors are reported through `log`.
 int load_mods(const char* dir, uint8_t* guest_base, void (*log)(const char*));
+
+// Returns the list of mods seen during the last load_mods() call (for the Settings Mod Menu).
+std::vector<ModStatus> get_mod_status_list();
 
 }  // namespace ppu

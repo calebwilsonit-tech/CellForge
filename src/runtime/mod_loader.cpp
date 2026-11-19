@@ -1,5 +1,8 @@
 #include "ppu_mod_api.h"
+#include "options.h"
 
+#include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -66,22 +69,61 @@ InitFn open_library(const std::string& path, std::string& err) {
 #endif
 }
 
+std::mutex g_mods_mu;
+std::vector<ModStatus> g_mod_statuses;
+
 }  // namespace
+
+std::vector<ModStatus> get_mod_status_list() {
+  std::lock_guard<std::mutex> lk(g_mods_mu);
+  return g_mod_statuses;
+}
 
 int load_mods(const char* dir, uint8_t* guest_base, void (*log)(const char*)) {
   g_log = log;
   static Ps3RecompModApi api;
   api = Ps3RecompModApi{PS3RECOMP_MOD_API_VERSION, guest_base, api_hook, api_unhook, api_call, api_log};
 
+  std::vector<ModStatus> statuses;
   int loaded = 0;
   for (const std::string& path : list_libraries(dir)) {
+    ModStatus st;
+    st.path = path;
+    st.filename = std::filesystem::path(path).filename().string();
+
+    if (cfg::get().is_mod_disabled(st.filename)) {
+      st.disabled = true;
+      st.detail = "disabled in Settings";
+      log_msg("mod " + st.filename + ": skipped (disabled in Settings)");
+      statuses.push_back(std::move(st));
+      continue;
+    }
+
     std::string err;
     InitFn init = open_library(path, err);
-    if (!init) { log_msg("mod " + path + ": " + err); continue; }
+    if (!init) {
+      st.detail = err;
+      log_msg("mod " + path + ": " + err);
+      statuses.push_back(std::move(st));
+      continue;
+    }
     const int rc = init(&api);
-    if (rc != 0) { log_msg("mod " + path + ": init returned " + std::to_string(rc)); continue; }
+    if (rc != 0) {
+      st.detail = "init returned " + std::to_string(rc);
+      log_msg("mod " + path + ": " + st.detail);
+      statuses.push_back(std::move(st));
+      continue;
+    }
+    st.loaded = true;
+    st.detail = "active";
     log_msg("loaded mod " + path);
+    statuses.push_back(std::move(st));
     ++loaded;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(g_mods_mu);
+    g_mod_statuses = std::move(statuses);
   }
   return loaded;
 }
