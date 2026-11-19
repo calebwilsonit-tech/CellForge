@@ -20,6 +20,11 @@ class Presenter {
   virtual bool alive() const { return true; }
   // Name of the GPU in use, or "" for non-GPU presenters.
   virtual std::string device_name() const { return {}; }
+  // Live display settings update (resolution, 0=windowed/1=borderless, vsync 0..2, linear 0/1, fps title).
+  virtual void configure(uint32_t /*w*/, uint32_t /*h*/, int /*display_mode*/, int /*vsync*/,
+                         int /*upscale_filter*/, bool /*fps_counter*/) {}
+  // Optional callbacks for in-game F1 settings hotkey and window focus changes.
+  virtual void set_callbacks(std::function<void()> /*on_settings*/, std::function<void(bool)> /*on_focus*/) {}
 };
 
 // Vulkan presenter with its own window. Picks a discrete GPU when there is one.

@@ -27,6 +27,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <filesystem>
+#include <fstream>
+#include "options.h"
 #include "profiler.h"
 #include "spirv_gen.h"
 
@@ -55,7 +58,8 @@ namespace {
   X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)              \
   X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)  \
   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)                \
-  X(vkGetQueryPoolResults) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetFenceStatus)
+  X(vkGetQueryPoolResults) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetFenceStatus)                       \
+  X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 
 struct Fns {
   PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -285,6 +289,9 @@ class VulkanRenderer final : public GpuRenderer {
   bool depth_clamp_ = false;
   bool aniso_enabled_ = false;
   float max_aniso_ = 1.0f;
+  VkPipelineCache pipe_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path pipe_cache_path_;
+  std::vector<Surface*> tmp_sources_;
 
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
@@ -332,7 +339,7 @@ class VulkanRenderer final : public GpuRenderer {
   std::unordered_map<uint64_t, Texture> textures_;
   std::unordered_map<uint64_t, VkImageView> frame_tex_cache_;
   uint64_t flush_seq_ = 1;
-  using SamplerKey = std::tuple<bool, bool, bool, bool, bool, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t, int32_t>;
+  using SamplerKey = std::tuple<bool, bool, bool, bool, int, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t, int32_t>;
   std::map<SamplerKey, VkSampler> samplers_;
   std::vector<std::pair<Surface*, VkDeviceSize>> pending_readback_;
 
@@ -591,6 +598,22 @@ bool VulkanRenderer::init() {
   sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   sci.maxLod = 0.0f;
   vk_.vkCreateSampler(device_, &sci, nullptr, &dummy_sampler_);
+  // Load disk-persisted Vulkan pipeline cache to eliminate shader hitching on subsequent runs.
+  {
+    std::vector<uint8_t> init_data;
+#if defined(_WIN32)
+    wchar_t la[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", la, MAX_PATH) > 0) {
+      pipe_cache_path_ = std::filesystem::path(la) / "CellForge" / "cache" / "pipelines.bin";
+      std::ifstream f(pipe_cache_path_, std::ios::binary);
+      if (f) init_data.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+#endif
+    VkPipelineCacheCreateInfo pcci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    pcci.initialDataSize = init_data.size();
+    pcci.pInitialData = init_data.empty() ? nullptr : init_data.data();
+    vk_.vkCreatePipelineCache(device_, &pcci, nullptr, &pipe_cache_);
+  }
   logf("rsx: GPU renderer on %s", name_.c_str());
   return true;
 }
@@ -656,6 +679,22 @@ void VulkanRenderer::shutdown() {
     for (auto& [k, p] : pipelines_) vk_.vkDestroyPipeline(device_, p, nullptr);
     if (pipe_d24_argb_) vk_.vkDestroyPipeline(device_, pipe_d24_argb_, nullptr);
     if (pipe_abgr_y16x16_) vk_.vkDestroyPipeline(device_, pipe_abgr_y16x16_, nullptr);
+    if (pipe_cache_) {
+      if (!pipe_cache_path_.empty()) {
+        size_t sz = 0;
+        if (vk_.vkGetPipelineCacheData(device_, pipe_cache_, &sz, nullptr) == VK_SUCCESS && sz > 0) {
+          std::vector<uint8_t> data(sz);
+          if (vk_.vkGetPipelineCacheData(device_, pipe_cache_, &sz, data.data()) == VK_SUCCESS) {
+            std::error_code ec;
+            std::filesystem::create_directories(pipe_cache_path_.parent_path(), ec);
+            std::ofstream f(pipe_cache_path_, std::ios::binary);
+            if (f) f.write(reinterpret_cast<const char*>(data.data()), std::streamsize(sz));
+          }
+        }
+      }
+      vk_.vkDestroyPipelineCache(device_, pipe_cache_, nullptr);
+      pipe_cache_ = VK_NULL_HANDLE;
+    }
     if (fs_d24_argb_) vk_.vkDestroyShaderModule(device_, fs_d24_argb_, nullptr);
     if (fs_abgr_y16x16_) vk_.vkDestroyShaderModule(device_, fs_abgr_y16x16_, nullptr);
     for (auto& [k, s] : fragment_shaders_) vk_.vkDestroyShaderModule(device_, s, nullptr);
@@ -1036,8 +1075,9 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   // Key: location, shape, format and a hash of the bytes (catches CPU updates).
   const uint32_t size = t.byte_size();
   const uint32_t d = t.is_3d() ? t.depth : 1u;
+  const bool want_mips = cfg::g_mipmaps_enabled.load(std::memory_order_relaxed);
   const uint32_t max_mips =
-      (!t.is_3d() && !t.is_shadow() && t.mipmap > 1 && (t.width > 1 || t.height > 1))
+      (want_mips && !t.is_3d() && !t.is_shadow() && t.mipmap > 1 && (t.width > 1 || t.height > 1))
           ? std::min<uint32_t>(t.mipmap, 1u + uint32_t(std::bit_width(std::max(t.width, t.height)) - 1))
           : 1u;
   const uint64_t desc_key =
@@ -1151,7 +1191,16 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   if (max_mips > 1) {
     uint32_t mw = t.width, mh = t.height;
     for (uint32_t lvl = 1; lvl < max_mips; ++lvl) {
-      barrier_all();
+      VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      ib.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+      ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      ib.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      ib.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      ib.image = tex.image.img;
+      ib.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, lvl - 1, 1, 0, layers};
+      vk_.vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                               nullptr, 1, &ib);
       const uint32_t nw = std::max(1u, mw >> 1), nh = std::max(1u, mh >> 1);
       VkImageBlit blit{};
       blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lvl - 1, 0, layers};
@@ -1259,9 +1308,13 @@ VkSampler VulkanRenderer::sampler(const TexUnit& t) {
   } else if (t.border_color == 0xFF000000u) {
     border_mode = 1u;
   }
-  const bool use_mip = t.use_mip && !shadow && !t.is_3d();
+  const bool want_mips = cfg::g_mipmaps_enabled.load(std::memory_order_relaxed);
+  const bool use_mip = want_mips && t.use_mip && !shadow && !t.is_3d();
   const bool mip_linear = use_mip && t.mip_linear;
-  const bool aniso = aniso_enabled_ && !shadow && !t.is_3d() && !t.cubemap && (t.min_linear || t.mag_linear);
+  const int req_af = std::min<int>(int(max_aniso_), cfg::g_aniso_level.load(std::memory_order_relaxed));
+  const int aniso = (aniso_enabled_ && req_af > 1 && !shadow && !t.is_3d() && !t.cubemap && (t.min_linear || t.mag_linear))
+                        ? req_af
+                        : 1;
   const int32_t bias_q = use_mip ? int32_t(std::clamp(t.lod_bias, -8.0f, 8.0f) * 16.0f) : 0;
   const SamplerKey key{t.mag_linear, t.min_linear, use_mip, mip_linear, aniso,
                        t.wrap_s, t.wrap_t, wrap_r, shadow, zfunc, border_mode, bias_q};
@@ -1286,8 +1339,8 @@ VkSampler VulkanRenderer::sampler(const TexUnit& t) {
   sci.addressModeV = address_mode(t.wrap_t);
   sci.addressModeW = t.is_3d() ? address_mode(wrap_r) : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   sci.mipLodBias = use_mip ? (float(bias_q) / 16.0f) : 0.0f;
-  sci.anisotropyEnable = aniso ? VK_TRUE : VK_FALSE;
-  sci.maxAnisotropy = aniso ? max_aniso_ : 1.0f;
+  sci.anisotropyEnable = aniso > 1 ? VK_TRUE : VK_FALSE;
+  sci.maxAnisotropy = float(aniso);
   sci.compareEnable = shadow ? VK_TRUE : VK_FALSE;
   sci.compareOp = shadow ? kShadowCompare[zfunc] : VK_COMPARE_OP_ALWAYS;
   sci.borderColor = border_mode == 2u ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
@@ -1503,7 +1556,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   gp.layout = pipeline_layout_;
   gp.renderPass = with_depth ? rp_depth_ : rp_color_;
   VkPipeline p = VK_NULL_HANDLE;
-  if (vk_.vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &p) != VK_SUCCESS) {
+  if (vk_.vkCreateGraphicsPipelines(device_, pipe_cache_, 1, &gp, nullptr, &p) != VK_SUCCESS) {
     if (error) *error = "pipeline creation failed";
     return VK_NULL_HANDLE;
   }

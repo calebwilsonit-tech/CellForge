@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
@@ -101,6 +102,9 @@ class VulkanPresenter final : public Presenter {
   }
 
   bool init(const std::string& title, uint32_t w, uint32_t h, const std::string& icon_path) {
+    base_title_ = title;
+    req_w_.store(w);
+    req_h_.store(h);
     if (!create_window(title, w, h, icon_path)) return false;
     return init_vulkan();
   }
@@ -108,8 +112,50 @@ class VulkanPresenter final : public Presenter {
   void present(const uint32_t* bgra, uint32_t w, uint32_t h, uint32_t pitch) override;
   bool alive() const override { return !closed_.load(); }
   std::string device_name() const override { return device_name_; }
+  void configure(uint32_t w, uint32_t h, int display_mode, int vsync, int upscale_filter, bool fps_counter) override {
+    const int old_vsync = vsync_mode_.exchange(vsync);
+    upscale_filter_.store(upscale_filter);
+    fps_counter_.store(fps_counter);
+    if (old_vsync != vsync) resized_ = true;
+    if (hwnd_) {
+      req_w_.store(w);
+      req_h_.store(h);
+      req_borderless_.store(display_mode == 1);
+      PostMessageW(hwnd_, WM_APP + 10, 0, 0);
+    }
+  }
+  void set_callbacks(std::function<void()> on_settings, std::function<void(bool)> on_focus) override {
+    std::lock_guard<std::mutex> lk(cb_m_);
+    on_settings_ = std::move(on_settings);
+    on_focus_ = std::move(on_focus);
+  }
 
  private:
+  void apply_window_mode(HWND hwnd, uint32_t w, uint32_t h, bool borderless) {
+    if (borderless) {
+      if (!is_borderless_) {
+        GetWindowRect(hwnd, &saved_rect_);
+        is_borderless_ = true;
+      }
+      MONITORINFO mi{sizeof(mi)};
+      GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+      SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+      SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                   mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
+                   SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+      is_borderless_ = false;
+      SetWindowLongPtrW(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+      RECT r{0, 0, LONG(w), LONG(h)};
+      AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+      const int win_w = r.right - r.left, win_h = r.bottom - r.top;
+      const int x = saved_rect_.right > saved_rect_.left ? saved_rect_.left : 100;
+      const int y = saved_rect_.bottom > saved_rect_.top ? saved_rect_.top : 100;
+      SetWindowPos(hwnd, HWND_NOTOPMOST, x, y, win_w, win_h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    resized_ = true;
+  }
+
   void logf(const char* fmt, ...) {
     char buf[512];
     va_list ap;
@@ -129,6 +175,40 @@ class VulkanPresenter final : public Presenter {
         return 0;
       case WM_SIZE:
         if (self) self->resized_ = true;
+        return 0;
+      case WM_ACTIVATE:
+        if (self) {
+          const bool active = LOWORD(wp) != WA_INACTIVE;
+          std::function<void(bool)> fn;
+          { std::lock_guard<std::mutex> lk(self->cb_m_); fn = self->on_focus_; }
+          if (fn) fn(active);
+        }
+        return 0;
+      case WM_KEYDOWN:
+        if (self && wp == VK_F1) {
+          std::function<void()> fn;
+          { std::lock_guard<std::mutex> lk(self->cb_m_); fn = self->on_settings_; }
+          if (fn) fn();
+          return 0;
+        }
+        break;
+      case WM_SYSKEYDOWN:
+        if (self && wp == VK_RETURN && (lp & (1 << 29))) {  // Alt+Enter
+          const bool next = !self->is_borderless_;
+          self->req_borderless_.store(next);
+          self->apply_window_mode(hwnd, self->req_w_.load(), self->req_h_.load(), next);
+          return 0;
+        }
+        break;
+      case WM_APP + 10:
+        if (self) self->apply_window_mode(hwnd, self->req_w_.load(), self->req_h_.load(), self->req_borderless_.load());
+        return 0;
+      case WM_APP + 11:
+        if (self) {
+          std::wstring t;
+          { std::lock_guard<std::mutex> lk(self->title_m_); t = self->pending_title_; }
+          SetWindowTextW(hwnd, t.c_str());
+        }
         return 0;
       case WM_DESTROY:
         PostQuitMessage(0);
@@ -344,9 +424,17 @@ class VulkanPresenter final : public Presenter {
     vk_.vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &nm, nullptr);
     std::vector<VkPresentModeKHR> modes(nm);
     vk_.vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &nm, modes.data());
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;  // vsync, always available
-    for (auto m : modes)
-      if (m == VK_PRESENT_MODE_MAILBOX_KHR) mode = m;  // low-latency vsync when offered
+    auto has_mode = [&](VkPresentModeKHR want) {
+      return std::find(modes.begin(), modes.end(), want) != modes.end();
+    };
+    const int vs = vsync_mode_.load();
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (vs == 0) {
+      if (has_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)) mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+      else if (has_mode(VK_PRESENT_MODE_MAILBOX_KHR)) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    } else if (vs == 1) {
+      if (has_mode(VK_PRESENT_MODE_MAILBOX_KHR)) mode = VK_PRESENT_MODE_MAILBOX_KHR;
+    }
 
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sci.surface = surface_;
@@ -464,6 +552,20 @@ class VulkanPresenter final : public Presenter {
 
   std::function<void(std::string_view)> log_;
   HICON custom_icon_ = nullptr;
+  std::string base_title_;
+  std::mutex cb_m_, title_m_;
+  std::function<void()> on_settings_;
+  std::function<void(bool)> on_focus_;
+  std::wstring pending_title_;
+  std::atomic<int> vsync_mode_{1};
+  std::atomic<int> upscale_filter_{1};
+  std::atomic<bool> fps_counter_{true};
+  std::atomic<uint32_t> req_w_{1280}, req_h_{720};
+  std::atomic<bool> req_borderless_{false};
+  bool is_borderless_ = false;
+  RECT saved_rect_{100, 100, 1380, 820};
+  std::chrono::steady_clock::time_point fps_t0_ = std::chrono::steady_clock::now();
+  uint32_t fps_frames_ = 0;
   std::thread window_thread_;
   HWND hwnd_ = nullptr;
   std::atomic<bool> closed_{false}, resized_{false};
@@ -540,8 +642,9 @@ void VulkanPresenter::present(const uint32_t* bgra, uint32_t w, uint32_t h, uint
   blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   blit.dstOffsets[0] = {ox, oy, 0};
   blit.dstOffsets[1] = {ox + dw, oy + dh, 1};
+  const VkFilter filt = upscale_filter_.load() == 0 ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
   vk_.vkCmdBlitImage(cmd_, src_image_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                     &blit, VK_FILTER_LINEAR);
+                     &blit, filt);
   barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0);
   vk_.vkEndCommandBuffer(cmd_);
 
@@ -564,6 +667,30 @@ void VulkanPresenter::present(const uint32_t* bgra, uint32_t w, uint32_t h, uint
   pi.pImageIndices = &index;
   r = vk_.vkQueuePresentKHR(queue_, &pi);
   if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) resized_ = true;
+
+  // Update live FPS counter in window title every 500 ms.
+  ++fps_frames_;
+  const auto now = std::chrono::steady_clock::now();
+  const double dt = std::chrono::duration<double>(now - fps_t0_).count();
+  if (dt >= 0.5) {
+    const double fps = double(fps_frames_) / dt;
+    fps_frames_ = 0;
+    fps_t0_ = now;
+    if (hwnd_) {
+      char buf[256];
+      if (fps_counter_.load())
+        std::snprintf(buf, sizeof(buf), "%s  |  %.1f FPS  [F1: Settings | Alt+Enter: Fullscreen]", base_title_.c_str(), fps);
+      else
+        std::snprintf(buf, sizeof(buf), "%s", base_title_.c_str());
+      const int wn = MultiByteToWideChar(CP_UTF8, 0, buf, -1, nullptr, 0);
+      if (wn > 0) {
+        std::wstring wt(size_t(wn - 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, buf, -1, wt.data(), wn);
+        { std::lock_guard<std::mutex> lk(title_m_); pending_title_ = std::move(wt); }
+        PostMessageW(hwnd_, WM_APP + 11, 0, 0);
+      }
+    }
+  }
 }
 
 }  // namespace

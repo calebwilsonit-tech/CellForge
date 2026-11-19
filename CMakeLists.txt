@@ -63,7 +63,8 @@ add_library(ps3_runtime STATIC
   src/runtime/spirv_gen.cpp src/runtime/vk_renderer.cpp
   src/runtime/audio.cpp src/runtime/audio_wasapi.cpp src/runtime/hle_audio.cpp
   src/runtime/lv2_spu.cpp src/runtime/hle_misc.cpp src/runtime/hle_spurs.cpp
-  src/runtime/hle_savedata.cpp src/runtime/profiler.cpp src/runtime/hid_pad.cpp)
+  src/runtime/hle_savedata.cpp src/runtime/profiler.cpp src/runtime/hid_pad.cpp
+  src/runtime/options.cpp src/runtime/settings_ui.cpp)
 if(WIN32)
   target_link_libraries(ps3_runtime PUBLIC ole32)
 endif()

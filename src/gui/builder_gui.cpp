@@ -23,6 +23,8 @@
 #include <thread>
 
 #include "builder_core.h"
+#include "options.h"
+#include "settings_ui.h"
 
 namespace {
 
@@ -40,6 +42,7 @@ enum : int {
   ID_PREREQS,
   ID_CANCEL,
   ID_PLAY,
+  ID_SETTINGS,
   ID_SAVES,
   ID_LOG,
   ID_STATUS,
@@ -64,7 +67,7 @@ constexpr COLORREF kColDisabled = RGB(38, 44, 58);
 constexpr int kBannerH = 140;
 
 HWND g_wnd, g_game, g_elf, g_install, g_log, g_status, g_prereq_lbl;
-HWND g_build, g_update, g_prereqs, g_cancel, g_play, g_saves;
+HWND g_build, g_update, g_prereqs, g_cancel, g_play, g_settings, g_saves;
 HWND g_lbl_game, g_lbl_elf, g_lbl_install, g_note;
 HFONT g_font_ui, g_font_bold, g_font_mono;
 HBRUSH g_br_bg, g_br_card;
@@ -114,6 +117,7 @@ void set_busy(bool busy) {
   EnableWindow(g_update, !busy);
   EnableWindow(g_prereqs, !busy);
   EnableWindow(g_play, !busy);
+  EnableWindow(g_settings, !busy);
   EnableWindow(g_saves, !busy);
   EnableWindow(g_cancel, busy);
   EnableWindow(GetDlgItem(g_wnd, ID_GAME_BROWSE), !busy);
@@ -310,6 +314,13 @@ void play() {
   }
 }
 
+void open_settings() {
+  builder::Settings s = current_settings();
+  const builder::Validation v = builder::validate(s);
+  const path dir = s.install_dir.empty() ? (v.ok ? builder::default_install_dir(v) : g_exe_dir) : s.install_dir;
+  cfg::show_settings_dialog(dir / "options.ini", g_wnd);
+}
+
 void open_saves() {
   builder::Settings s = current_settings();
   const builder::Validation v = builder::validate(s);
@@ -444,12 +455,13 @@ void layout(int w, int h) {
   y += 24;
 
   int bx = m;
-  MoveWindow(g_play, bx, y, 92, 34, TRUE); bx += 100;
-  MoveWindow(g_build, bx, y, 132, 34, TRUE); bx += 140;
-  MoveWindow(g_update, bx, y, 130, 34, TRUE); bx += 138;
-  MoveWindow(g_prereqs, bx, y, 124, 34, TRUE); bx += 132;
-  MoveWindow(g_cancel, bx, y, 80, 34, TRUE);
-  MoveWindow(g_saves, w - m - 96, y, 96, 34, TRUE);
+  MoveWindow(g_play, bx, y, 84, 34, TRUE); bx += 90;
+  MoveWindow(g_build, bx, y, 122, 34, TRUE); bx += 128;
+  MoveWindow(g_update, bx, y, 122, 34, TRUE); bx += 128;
+  MoveWindow(g_prereqs, bx, y, 114, 34, TRUE); bx += 120;
+  MoveWindow(g_cancel, bx, y, 74, 34, TRUE);
+  MoveWindow(g_saves, w - m - 76, y, 76, 34, TRUE);
+  MoveWindow(g_settings, w - m - 76 - 92, y, 86, 34, TRUE);
   y += 42;
 
   MoveWindow(g_status, m, y, w - 2 * m, 18, TRUE);
@@ -495,6 +507,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       g_update = make(L"BUTTON", L"Update Runtime", BS_OWNERDRAW | WS_TABSTOP, ID_UPDATE, g_font_bold);
       g_prereqs = make(L"BUTTON", L"Install Prereqs", BS_OWNERDRAW | WS_TABSTOP, ID_PREREQS, g_font_bold);
       g_cancel = make(L"BUTTON", L"Cancel", BS_OWNERDRAW | WS_TABSTOP, ID_CANCEL, g_font_bold);
+      g_settings = make(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, ID_SETTINGS, g_font_bold);
       g_saves = make(L"BUTTON", L"Saves", BS_OWNERDRAW | WS_TABSTOP, ID_SAVES, g_font_bold);
 
       g_status = make(L"STATIC", L"", SS_LEFTNOWORDWRAP, ID_STATUS);
@@ -582,6 +595,7 @@ LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
           SetWindowTextW(g_status, L"Cancelling...");
           break;
         case ID_PLAY: play(); break;
+        case ID_SETTINGS: open_settings(); break;
         case ID_SAVES: open_saves(); break;
       }
       return 0;

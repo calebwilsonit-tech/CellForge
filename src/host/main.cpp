@@ -16,6 +16,8 @@
 #endif
 
 #include "boot.h"
+#include "options.h"
+#include "settings_ui.h"
 
 namespace {
 
@@ -110,11 +112,26 @@ void auto_discover(ppu::BootOptions& opt) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // Load user graphics/audio options from options.ini next to the executable.
+  {
+    namespace fs = std::filesystem;
+    fs::path exe_dir = fs::current_path();
+#if defined(_WIN32)
+    wchar_t buf[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, buf, MAX_PATH)) exe_dir = fs::path(buf).parent_path();
+#endif
+    cfg::ini_path() = exe_dir / "options.ini";
+    cfg::load(cfg::ini_path(), cfg::get());
+    cfg::sync_atomics(cfg::get());
+  }
+
   ppu::BootOptions opt;
   opt.mods_dir = "mods";
+  bool open_settings = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
-    if (a == "--mods" && i + 1 < argc) opt.mods_dir = argv[++i];
+    if (a == "--settings") open_settings = true;
+    else if (a == "--mods" && i + 1 < argc) opt.mods_dir = argv[++i];
     else if (a == "--no-mods") opt.mods_dir.clear();
     else if (a == "--strict") opt.strict = true;
     else if (a == "--headless") opt.headless = true;
@@ -126,6 +143,10 @@ int main(int argc, char** argv) {
     else if (a == "--") { for (++i; i < argc; ++i) opt.args.push_back(argv[i]); }
     else if (opt.elf_path.empty()) opt.elf_path = a;
     else { std::fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
+  }
+  if (open_settings) {
+    cfg::show_settings_dialog(cfg::ini_path());
+    return 0;
   }
   if (opt.elf_path.empty()) auto_discover(opt);
   if (opt.elf_path.empty()) {

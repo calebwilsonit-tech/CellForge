@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "lv2.h"
+#include "options.h"
 
 namespace audio {
 namespace {
@@ -135,7 +136,11 @@ void Mixer::step() {
     keys = notify_keys;
   }
   uint32_t clip = 0;
+  const bool muted = cfg::g_mute_in_background.load(std::memory_order_relaxed) &&
+                     !cfg::g_window_focused.load(std::memory_order_relaxed);
+  const float gain = muted ? 0.0f : (cfg::g_master_volume.load(std::memory_order_relaxed) * 0.01f);
   for (float& s : mix) {
+    s *= gain;
     if (!(s >= -1.0f && s <= 1.0f)) {  // also catches NaN
       ++clip;
       s = s > 0.0f ? 1.0f : s < 0.0f ? -1.0f : 0.0f;

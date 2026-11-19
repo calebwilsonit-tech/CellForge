@@ -10,10 +10,12 @@
 #include "guest_memory.h"
 #include "hle.h"
 #include "lv2.h"
+#include "options.h"
 #include "ppu_mod_api.h"
 #include "ppu_runtime.h"
 #include "ps3_exec.h"
 #include "rsx.h"
+#include "settings_ui.h"
 #include "vfs.h"
 
 #include <filesystem>
@@ -186,7 +188,17 @@ int boot(const BootOptions& opt) {
       if (std::filesystem::exists(candidate, ec)) icon_path = candidate.string();
     }
     rsx::Rsx::get().presenter_factory = [title, icon_path, log = k.log]() -> std::shared_ptr<gfx::Presenter> {
-      return std::shared_ptr<gfx::Presenter>(gfx::create_vulkan_presenter(title, log, 1280, 720, icon_path));
+      const uint32_t ww = cfg::g_window_width.load();
+      const uint32_t wh = cfg::g_window_height.load();
+      auto p = std::shared_ptr<gfx::Presenter>(gfx::create_vulkan_presenter(title, log, ww, wh, icon_path));
+      if (p) {
+        p->set_callbacks(
+            [] { cfg::toggle_settings_dialog_async(cfg::ini_path()); },
+            [](bool active) { cfg::g_window_focused.store(active, std::memory_order_relaxed); });
+        p->configure(ww, wh, cfg::g_display_mode.load(), cfg::g_vsync_mode.load(),
+                     cfg::g_upscale_filter.load(), cfg::g_fps_counter_enabled.load());
+      }
+      return p;
     };
     rsx::Rsx::get().set_presenter(rsx::Rsx::get().presenter_factory());
   }

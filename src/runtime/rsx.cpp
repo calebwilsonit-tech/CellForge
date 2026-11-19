@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "lv2.h"
+#include "options.h"
 #include "profiler.h"
 #include "vk_renderer.h"
 
@@ -338,6 +339,14 @@ void Rsx::flip(uint32_t id, bool immediate) {
     poll_gpu();
     last_flip_vblank_ = vb;
   }
+  const int cap = cfg::g_fps_cap.load(std::memory_order_relaxed);
+  if (cap > 0 && last_flip_time > 0 && !stop_) {
+    const uint64_t target_us = 1000000ull / uint64_t(cap);
+    const uint64_t elapsed = lv2::system_time_us() - last_flip_time;
+    if (elapsed < target_us) {
+      std::this_thread::sleep_for(std::chrono::microseconds(target_us - elapsed));
+    }
+  }
   last_flip_time = lv2::system_time_us();
   ++stats.flips;
   flip_status = 0;
@@ -351,6 +360,16 @@ void Rsx::present_display(const DisplayBuffer& d, uint32_t base, uint64_t flip_n
   {
     std::lock_guard<std::mutex> lk(present_m_);
     p = presenter_;
+  }
+  if (p) {
+    static uint32_t applied_gen = 0;
+    const uint32_t gen = cfg::g_settings_gen.load(std::memory_order_acquire);
+    if (gen != applied_gen) {
+      applied_gen = gen;
+      p->configure(cfg::g_window_width.load(), cfg::g_window_height.load(),
+                   cfg::g_display_mode.load(), cfg::g_vsync_mode.load(),
+                   cfg::g_upscale_filter.load(), cfg::g_fps_counter_enabled.load());
+    }
   }
   static const char* dump = std::getenv("PS3RECOMP_DUMP_FRAME");
   std::string dump_file;
