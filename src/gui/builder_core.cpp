@@ -394,7 +394,9 @@ fs::path default_work_dir(const fs::path& repo, const Validation& v) {
   std::string name = v.title_id.empty() ? "game" : v.title_id;
   for (char& c : name)
     if (!(std::isalnum(uint8_t(c)) || c == '_' || c == '-')) c = '_';
-  if (!repo.empty()) return repo / "out" / name;
+  std::error_code ec;
+  if (!repo.empty() && fs::is_directory(repo / ".git", ec)) return repo / "out" / name;
+  if (!repo.empty() && repo.string().find("CellForge-master") == std::string::npos) return repo / "out" / name;
   return cellforge_app_dir() / "work" / name;
 }
 

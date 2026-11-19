@@ -45,6 +45,7 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& out, SpirvVpMe
 // does not handle; the caller then falls back to the CPU renderer for that draw.
 bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::vector<uint32_t>& out,
                         std::string* error, bool alpha_test = false, uint32_t alpha_func = 0x207,
-                        uint8_t alpha_ref = 0, uint16_t tex_3d_mask = 0, uint16_t tex_shadow_mask = 0);
+                        uint8_t alpha_ref = 0, uint16_t tex_3d_mask = 0, uint16_t tex_shadow_mask = 0,
+                        uint16_t tex_cube_mask = 0);
 
 }  // namespace rsx

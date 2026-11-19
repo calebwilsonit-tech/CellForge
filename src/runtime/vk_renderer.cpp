@@ -55,7 +55,7 @@ namespace {
   X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreateDescriptorPool)              \
   X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets)  \
   X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp)                \
-  X(vkGetQueryPoolResults) X(vkCmdCopyImage) X(vkGetFenceStatus)
+  X(vkGetQueryPoolResults) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkGetFenceStatus)
 
 struct Fns {
   PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
@@ -245,11 +245,12 @@ class VulkanRenderer final : public GpuRenderer {
   bool make_buffer(Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage);
   void free_buffer(Buffer& b);
   bool make_image(Image& im, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect,
-                  uint32_t d = 1, bool is_3d = false, bool mutable_srgb = false);
+                  uint32_t d = 1, bool is_3d = false, bool mutable_srgb = false, uint32_t mip_levels = 1,
+                  bool is_cube = false);
   void free_image(Image& im);
   void begin();
   void barrier_all();
-  void transition_general(VkImage img, VkImageAspectFlags aspect);
+  void transition_general(VkImage img, VkImageAspectFlags aspect, uint32_t mip_levels = 1, uint32_t layers = 1);
   // Allocates from a ring; returns false if the ring is full (caller flushes).
   bool ring_alloc(Buffer& ring, VkDeviceSize size, VkDeviceSize& offset);
 
@@ -282,6 +283,8 @@ class VulkanRenderer final : public GpuRenderer {
   uint32_t queue_family_ = 0;
   std::string name_;
   bool depth_clamp_ = false;
+  bool aniso_enabled_ = false;
+  float max_aniso_ = 1.0f;
 
   VkCommandPool pool_ = VK_NULL_HANDLE;
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
@@ -327,8 +330,9 @@ class VulkanRenderer final : public GpuRenderer {
   VkDeviceSize last_vp_ubo_off_ = 0;
   bool last_vp_ubo_valid_ = false;
   std::unordered_map<uint64_t, Texture> textures_;
+  std::unordered_map<uint64_t, VkImageView> frame_tex_cache_;
   uint64_t flush_seq_ = 1;
-  using SamplerKey = std::tuple<bool, bool, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t>;
+  using SamplerKey = std::tuple<bool, bool, bool, bool, bool, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t, int32_t>;
   std::map<SamplerKey, VkSampler> samplers_;
   std::vector<std::pair<Surface*, VkDeviceSize>> pending_readback_;
 
@@ -426,6 +430,7 @@ bool VulkanRenderer::init() {
         best = score; gpu_ = pd; queue_family_ = i; name_ = props.deviceName;
         ts_period_ns_ = props.limits.timestampPeriod;
         ts_valid_ = qf[i].timestampValidBits != 0;
+        max_aniso_ = std::min(16.0f, std::max(1.0f, props.limits.maxSamplerAnisotropy));
       }
       break;
     }
@@ -437,6 +442,8 @@ bool VulkanRenderer::init() {
   VkPhysicalDeviceFeatures want{};
   depth_clamp_ = have.depthClamp == VK_TRUE;
   want.depthClamp = have.depthClamp;
+  aniso_enabled_ = have.samplerAnisotropy == VK_TRUE && max_aniso_ > 1.0f;
+  want.samplerAnisotropy = aniso_enabled_ ? VK_TRUE : VK_FALSE;
   const float prio = 1.0f;
   VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
   qci.queueFamilyIndex = queue_family_;
@@ -728,15 +735,18 @@ void VulkanRenderer::free_buffer(Buffer& b) {
 }
 
 bool VulkanRenderer::make_image(Image& im, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage,
-                                VkImageAspectFlags aspect, uint32_t d, bool is_3d, bool mutable_srgb) {
+                                VkImageAspectFlags aspect, uint32_t d, bool is_3d, bool mutable_srgb,
+                                uint32_t mip_levels, bool is_cube) {
   const bool make_srgb_view = mutable_srgb && fmt == VK_FORMAT_R8G8B8A8_UNORM;
+  const uint32_t layers = is_cube ? 6u : 1u;
   VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-  ici.flags = make_srgb_view ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
+  ici.flags = (make_srgb_view ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0u) |
+              (is_cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u);
   ici.imageType = is_3d ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
   ici.format = fmt;
   ici.extent = {w, h, is_3d ? std::max(1u, d) : 1u};
-  ici.mipLevels = 1;
-  ici.arrayLayers = 1;
+  ici.mipLevels = std::max(1u, mip_levels);
+  ici.arrayLayers = layers;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
   ici.usage = usage;
@@ -751,14 +761,14 @@ bool VulkanRenderer::make_image(Image& im, uint32_t w, uint32_t h, VkFormat fmt,
   vk_.vkBindImageMemory(device_, im.img, im.mem, 0);
   VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   vci.image = im.img;
-  vci.viewType = is_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+  vci.viewType = is_cube ? VK_IMAGE_VIEW_TYPE_CUBE : (is_3d ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D);
   vci.format = fmt;
   if (aspect == VK_IMAGE_ASPECT_DEPTH_BIT) {
     vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_ONE};
   } else if (fmt == VK_FORMAT_R16G16_UNORM) {
     vci.components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE};
   }
-  vci.subresourceRange = {aspect, 0, 1, 0, 1};
+  vci.subresourceRange = {aspect, 0, ici.mipLevels, 0, layers};
   if (vk_.vkCreateImageView(device_, &vci, nullptr, &im.view) != VK_SUCCESS) return false;
   if (make_srgb_view) {
     vci.format = VK_FORMAT_R8G8B8A8_SRGB;
@@ -812,7 +822,7 @@ void VulkanRenderer::barrier_all() {
                            nullptr, 0, nullptr);
 }
 
-void VulkanRenderer::transition_general(VkImage img, VkImageAspectFlags aspect) {
+void VulkanRenderer::transition_general(VkImage img, VkImageAspectFlags aspect, uint32_t mip_levels, uint32_t layers) {
   end_pass();
   VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
   b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -820,7 +830,7 @@ void VulkanRenderer::transition_general(VkImage img, VkImageAspectFlags aspect) 
   b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
   b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   b.image = img;
-  b.subresourceRange = {aspect, 0, 1, 0, 1};
+  b.subresourceRange = {aspect, 0, std::max(1u, mip_levels), 0, std::max(1u, layers)};
   vk_.vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr,
                            0, nullptr, 1, &b);
 }
@@ -966,6 +976,7 @@ void VulkanRenderer::invalidate(uint32_t addr, uint32_t size) {
       s->needs_upload = true;
       ++s->write_seq;
     }
+  frame_tex_cache_.clear();
 }
 
 VkFramebuffer VulkanRenderer::framebuffer(Surface* color, Surface* depth) {
@@ -1024,22 +1035,37 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   // Key: location, shape, format and a hash of the bytes (catches CPU updates).
   const uint32_t size = t.byte_size();
-  uint64_t h = hash_bytes(t.base, size);
+  const uint32_t d = t.is_3d() ? t.depth : 1u;
+  const uint32_t max_mips =
+      (!t.is_3d() && !t.is_shadow() && t.mipmap > 1 && (t.width > 1 || t.height > 1))
+          ? std::min<uint32_t>(t.mipmap, 1u + uint32_t(std::bit_width(std::max(t.width, t.height)) - 1))
+          : 1u;
+  const uint64_t desc_key =
+      (uint64_t(t.address) << 1) ^ (uint64_t(t.format) << 40) ^ (uint64_t(t.width) << 20) ^ (uint64_t(t.height) << 52) ^
+      (uint64_t(d) * 0x517CC1B727220A95ull) ^ (uint64_t(t.dimension) << 60) ^
+      (t.linear_layout ? 0x5555ull : 0ull) ^ (t.is_srgb() ? 0xAAAA0000ull : 0ull) ^
+      (t.is_shadow() ? 0x333300000000ull : 0ull) ^ (t.cubemap ? 0x77770000000000ull : 0ull) ^
+      (uint64_t(max_mips) * 0xBF58476D1CE4E5B9ull) ^ (uint64_t(t.pitch) * 0x9E3779B97F4A7C15ull);
+
   bool dynamic_rt = false;
+  uint64_t surf_mix = 0;
   for (const auto& s : surfaces_) {
     if (s->addr && t.address < s->addr + s->span() && s->addr < t.address + size) {
-      h ^= (s->write_seq + 1) * 0xBF58476D1CE4E5B9ull;
+      surf_mix ^= (s->write_seq + 1) * 0xBF58476D1CE4E5B9ull;
       dynamic_rt = true;
     }
   }
-  const uint32_t d = t.is_3d() ? t.depth : 1u;
-  h ^= (uint64_t(t.address) << 1) ^ (uint64_t(t.format) << 40) ^ (uint64_t(t.width) << 20) ^ (uint64_t(t.height) << 52) ^
-       (uint64_t(d) * 0x517CC1B727220A95ull) ^ (uint64_t(t.dimension) << 60) ^
-       (t.linear_layout ? 0x5555ull : 0ull) ^ (t.is_srgb() ? 0xAAAA0000ull : 0ull) ^
-       (t.is_shadow() ? 0x333300000000ull : 0ull) ^ (uint64_t(t.pitch) * 0x9E3779B97F4A7C15ull);
+  // Per-frame fast path: static textures already verified this frame skip re-hashing.
+  if (!dynamic_rt) {
+    auto fc = frame_tex_cache_.find(desc_key);
+    if (fc != frame_tex_cache_.end()) return fc->second;
+  }
+
+  uint64_t h = hash_bytes(t.base, size) ^ desc_key ^ surf_mix;
   auto it = textures_.find(h);
   if (it != textures_.end()) {
     it->second.last_flush = flush_seq_;
+    if (!dynamic_rt) frame_tex_cache_[desc_key] = it->second.image.view;
     return it->second.image.view;
   }
 
@@ -1099,9 +1125,11 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   std::vector<uint32_t> rgba;
   decode_texture_rgba(t, rgba);
   const VkFormat fmt = t.is_srgb() ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-  if (!make_image(tex.image, t.width, t.height, fmt,
-                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
-                  d, t.is_3d(), false)) {
+  const uint32_t layers = t.cubemap ? 6u : 1u;
+  const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                  (max_mips > 1 ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
+  if (!make_image(tex.image, t.width, t.height, fmt, usage, VK_IMAGE_ASPECT_COLOR_BIT, d, t.is_3d(), false, max_mips,
+                  t.cubemap)) {
     if (error) *error = "texture allocation failed";
     return VK_NULL_HANDLE;
   }
@@ -1114,15 +1142,32 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   }
   std::memcpy(upload_.ptr + off, rgba.data(), rgba.size() * 4);
   begin();
-  transition_general(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT);
+  transition_general(tex.image.img, VK_IMAGE_ASPECT_COLOR_BIT, max_mips, layers);
   VkBufferImageCopy c{};
   c.bufferOffset = off;
-  c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, layers};
   c.imageExtent = {t.width, t.height, d};
   vk_.vkCmdCopyBufferToImage(cmd_, upload_.buf, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+  if (max_mips > 1) {
+    uint32_t mw = t.width, mh = t.height;
+    for (uint32_t lvl = 1; lvl < max_mips; ++lvl) {
+      barrier_all();
+      const uint32_t nw = std::max(1u, mw >> 1), nh = std::max(1u, mh >> 1);
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lvl - 1, 0, layers};
+      blit.srcOffsets[1] = {int32_t(mw), int32_t(mh), 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lvl, 0, layers};
+      blit.dstOffsets[1] = {int32_t(nw), int32_t(nh), 1};
+      vk_.vkCmdBlitImage(cmd_, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, tex.image.img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                         VK_FILTER_LINEAR);
+      mw = nw;
+      mh = nh;
+    }
+  }
   barrier_all();
   const VkImageView view = tex.image.view;
   textures_[h] = tex;
+  if (!dynamic_rt) frame_tex_cache_[desc_key] = view;
   return view;
 }
 
@@ -1131,7 +1176,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
 // starts inside the texture, and is not the target currently being drawn.
 bool VulkanRenderer::composite_sources(const TexUnit& t, uint32_t target_addr, std::vector<Surface*>& out) {
   out.clear();
-  if (t.is_3d() || t.format != 0x85 || !t.linear_layout || !t.pitch) return false;
+  if (t.is_3d() || t.cubemap || t.format != 0x85 || !t.linear_layout || !t.pitch) return false;
   const uint64_t lo = t.address, hi = lo + uint64_t(t.pitch) * t.height;
   for (auto& s : surfaces_) {
     if (!s->addr || !(s->addr < hi && uint64_t(s->addr) + s->span() > lo)) continue;
@@ -1214,7 +1259,12 @@ VkSampler VulkanRenderer::sampler(const TexUnit& t) {
   } else if (t.border_color == 0xFF000000u) {
     border_mode = 1u;
   }
-  const SamplerKey key{t.mag_linear, t.min_linear, t.wrap_s, t.wrap_t, wrap_r, shadow, zfunc, border_mode};
+  const bool use_mip = t.use_mip && !shadow && !t.is_3d();
+  const bool mip_linear = use_mip && t.mip_linear;
+  const bool aniso = aniso_enabled_ && !shadow && !t.is_3d() && !t.cubemap && (t.min_linear || t.mag_linear);
+  const int32_t bias_q = use_mip ? int32_t(std::clamp(t.lod_bias, -8.0f, 8.0f) * 16.0f) : 0;
+  const SamplerKey key{t.mag_linear, t.min_linear, use_mip, mip_linear, aniso,
+                       t.wrap_s, t.wrap_t, wrap_r, shadow, zfunc, border_mode, bias_q};
   auto it = samplers_.find(key);
   if (it != samplers_.end()) return it->second;
   // RSX compares D_tex <zfunc> D_ref; Vulkan compares D_ref <compareOp> D_tex.
@@ -1231,15 +1281,20 @@ VkSampler VulkanRenderer::sampler(const TexUnit& t) {
   VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
   sci.magFilter = t.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
   sci.minFilter = t.min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+  sci.mipmapMode = mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
   sci.addressModeU = address_mode(t.wrap_s);
   sci.addressModeV = address_mode(t.wrap_t);
   sci.addressModeW = t.is_3d() ? address_mode(wrap_r) : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.mipLodBias = use_mip ? (float(bias_q) / 16.0f) : 0.0f;
+  sci.anisotropyEnable = aniso ? VK_TRUE : VK_FALSE;
+  sci.maxAnisotropy = aniso ? max_aniso_ : 1.0f;
   sci.compareEnable = shadow ? VK_TRUE : VK_FALSE;
   sci.compareOp = shadow ? kShadowCompare[zfunc] : VK_COMPARE_OP_ALWAYS;
   sci.borderColor = border_mode == 2u ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE
                     : border_mode == 1u ? VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK
                                         : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-  sci.maxLod = 0.0f;
+  sci.minLod = 0.0f;
+  sci.maxLod = use_mip ? VK_LOD_CLAMP_NONE : 0.0f;
   VkSampler s = VK_NULL_HANDLE;
   vk_.vkCreateSampler(device_, &sci, nullptr, &s);
   samplers_[key] = s;
@@ -1311,10 +1366,11 @@ const VulkanRenderer::CachedVp* VulkanRenderer::get_vp(const VpState& vp, std::s
 
 VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, const CachedVp* vp, std::string* error) {
   const bool use_alpha_test = d.alpha_test && d.alpha_func != 0x207;
-  uint16_t tex_3d_mask = 0, tex_shadow_mask = 0;
+  uint16_t tex_3d_mask = 0, tex_shadow_mask = 0, tex_cube_mask = 0;
   for (uint32_t u = 0; u < 16; ++u) {
     if (!d.tex[u].enabled || !d.tex[u].base) continue;
-    if (d.tex[u].is_3d()) tex_3d_mask |= uint16_t(1u << u);
+    if (d.tex[u].is_cube()) tex_cube_mask |= uint16_t(1u << u);
+    else if (d.tex[u].is_3d()) tex_3d_mask |= uint16_t(1u << u);
     else if (d.tex[u].is_shadow()) tex_shadow_mask |= uint16_t(1u << u);
   }
   uint64_t key = d.fp_hash;
@@ -1322,7 +1378,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   mix(d.blend); mix(d.sf_rgb); mix(d.sf_a); mix(d.df_rgb); mix(d.df_a); mix(d.eq_rgb); mix(d.eq_a);
   mix(d.color_mask); mix(with_depth); mix(d.depth_test); mix(d.depth_write); mix(d.depth_func);
   mix(use_alpha_test); mix(use_alpha_test ? d.alpha_func : 0x207u); mix(use_alpha_test ? d.alpha_ref : 0u);
-  mix(tex_3d_mask); mix(tex_shadow_mask);
+  mix(tex_3d_mask); mix(tex_shadow_mask); mix(tex_cube_mask);
   mix(vp ? vp->hash : 0ull);
   mix(vp ? (1u + vp->meta.in_count) : 0u);
   mix(vp && d.cull ? 1u : 0u);
@@ -1336,8 +1392,9 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
     fkey = (fkey ^ d.alpha_func ^ 0xA1FA7E57u) * 1099511628211ull;
     fkey = (fkey ^ d.alpha_ref) * 1099511628211ull;
   }
-  if (tex_3d_mask || tex_shadow_mask) {
-    fkey = (fkey ^ ((uint64_t(tex_3d_mask) << 16) | tex_shadow_mask) ^ 0x3D5AD000ull) * 1099511628211ull;
+  if (tex_3d_mask || tex_shadow_mask || tex_cube_mask) {
+    fkey = (fkey ^ ((uint64_t(tex_cube_mask) << 32) | (uint64_t(tex_3d_mask) << 16) | tex_shadow_mask) ^ 0x3D5AD000ull) *
+           1099511628211ull;
   }
   VkShaderModule fs = VK_NULL_HANDLE;
   auto fit = fragment_shaders_.find(fkey);
@@ -1346,7 +1403,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   } else {
     std::vector<uint32_t> code;
     if (!spirv_translate_fp(d.fp, d.fp32_out, code, error, use_alpha_test, d.alpha_func, d.alpha_ref,
-                            tex_3d_mask, tex_shadow_mask))
+                            tex_3d_mask, tex_shadow_mask, tex_cube_mask))
       return VK_NULL_HANDLE;
     fs = shader(code);
     if (!fs) {
@@ -1570,7 +1627,7 @@ bool VulkanRenderer::run_convert_pass(Surface& src, ConvertedImage& dst, VkPipel
 }
 
 bool VulkanRenderer::can_gpu_tex(const TexUnit& t, uint32_t target_color, uint32_t target_depth) const {
-  if (t.is_3d()) return false;
+  if (t.is_3d() || t.cubemap) return false;
   for (const auto& s : surfaces_) {
     if (!s->addr || s->needs_upload || s->addr != t.address || s->image.w != t.width || s->image.h != t.height)
       continue;
@@ -1584,7 +1641,7 @@ bool VulkanRenderer::can_gpu_tex(const TexUnit& t, uint32_t target_color, uint32
 
 VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_color, Surface* active_depth,
                                             std::string* error) {
-  if (t.is_3d()) return VK_NULL_HANDLE;
+  if (t.is_3d() || t.cubemap) return VK_NULL_HANDLE;
   for (auto& s : surfaces_) {
     if (!s->addr || s->needs_upload || s->addr != t.address || s->image.w != t.width || s->image.h != t.height)
       continue;
@@ -2207,6 +2264,7 @@ void VulkanRenderer::write_back(uint8_t* mem, const Buffer& readback,
 
 void VulkanRenderer::evict_textures() {
   ++flush_seq_;
+  frame_tex_cache_.clear();
   for (auto it = textures_.begin(); it != textures_.end();) {
     if (it->second.dynamic_rt && flush_seq_ - it->second.last_flush > 3) {
       free_image(it->second.image);

@@ -90,6 +90,11 @@ class Module {
     const uint32_t img = cached(k_img_sh_, [&](uint32_t i) { emit(types_, OpTypeImage, {i, f, 1, 1, 0, 0, 1, 0}); });
     return cached(k_simg_sh_, [&](uint32_t i) { emit(types_, OpTypeSampledImage, {i, img}); });
   }
+  uint32_t t_sampled_image_cube() {
+    const uint32_t f = t_float();
+    const uint32_t img = cached(k_img_cube_, [&](uint32_t i) { emit(types_, OpTypeImage, {i, f, 3, 0, 0, 0, 1, 0}); });
+    return cached(k_simg_cube_, [&](uint32_t i) { emit(types_, OpTypeSampledImage, {i, img}); });
+  }
   uint32_t t_ptr(uint32_t storage, uint32_t type) {
     auto key = std::make_pair(storage, type);
     auto it = ptrs_.find(key);
@@ -183,7 +188,7 @@ class Module {
   uint32_t next_ = 1;
   uint32_t k_void_ = 0, k_bool_ = 0, k_u32_ = 0, k_s32_ = 0, k_float_ = 0, k_vec_[5] = {}, k_ivec4_ = 0,
            k_ivec4_zero_ = 0, k_bvec4_ = 0, k_fn_ = 0, k_img_ = 0, k_simg_ = 0, k_img3d_ = 0, k_simg3d_ = 0,
-           k_img_sh_ = 0, k_simg_sh_ = 0, k_true_ = 0, k_false_ = 0;
+           k_img_sh_ = 0, k_simg_sh_ = 0, k_img_cube_ = 0, k_simg_cube_ = 0, k_true_ = 0, k_false_ = 0;
   std::map<std::pair<uint32_t, uint32_t>, uint32_t> ptrs_;
   std::map<uint32_t, uint32_t> u32s_;
   std::map<int32_t, uint32_t> s32s_;
@@ -666,7 +671,7 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
 
 bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::vector<uint32_t>& spirv,
                         std::string* error, bool alpha_test, uint32_t alpha_func, uint8_t alpha_ref,
-                        uint16_t tex_3d_mask, uint16_t tex_shadow_mask) {
+                        uint16_t tex_3d_mask, uint16_t tex_shadow_mask, uint16_t tex_cube_mask) {
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
 
   // ---- scan the program for registers, inputs, textures and inline constants ----
@@ -724,9 +729,13 @@ bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::
   iface.push_back(out_var);
   std::map<uint32_t, uint32_t> tex_var;
   for (uint32_t u : units) {
-    const bool is_3d = (tex_3d_mask & (1u << u)) != 0;
-    const bool is_shadow = !is_3d && ((tex_shadow_mask & (1u << u)) != 0);
-    const uint32_t ty = is_3d ? m.t_sampled_image_3d() : is_shadow ? m.t_sampled_image_shadow() : m.t_sampled_image();
+    const bool is_cube = (tex_cube_mask & (1u << u)) != 0;
+    const bool is_3d = !is_cube && ((tex_3d_mask & (1u << u)) != 0);
+    const bool is_shadow = !is_cube && !is_3d && ((tex_shadow_mask & (1u << u)) != 0);
+    const uint32_t ty = is_cube ? m.t_sampled_image_cube()
+                        : is_3d ? m.t_sampled_image_3d()
+                        : is_shadow ? m.t_sampled_image_shadow()
+                                    : m.t_sampled_image();
     const uint32_t v = m.global_var(SC_UniformConstant, ty);
     m.decorate(v, Dec_DescriptorSet, 0);
     m.decorate(v, Dec_Binding, u);
@@ -834,8 +843,9 @@ bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::
 
   auto sample = [&](const FpInsn& i, uint32_t coord_v4, int mode) -> uint32_t {
     if (!tex_var.count(i.tex)) return v0;
-    const bool is_3d = (tex_3d_mask & (1u << i.tex)) != 0;
-    const bool is_shadow = !is_3d && ((tex_shadow_mask & (1u << i.tex)) != 0);
+    const bool is_cube = (tex_cube_mask & (1u << i.tex)) != 0;
+    const bool is_3d = !is_cube && ((tex_3d_mask & (1u << i.tex)) != 0);
+    const bool is_shadow = !is_cube && !is_3d && ((tex_shadow_mask & (1u << i.tex)) != 0);
     auto safe_inv_w = [&] {
       const uint32_t w = extract(coord_v4, 3);
       const uint32_t is0 = op2(OpFOrdEqual, tb, w, f0);
@@ -860,9 +870,13 @@ bool spirv_translate_fp(const std::vector<FpInsn>& prog, bool fp32_output, std::
       }
       return r;
     }
-    const uint32_t img = load(is_3d ? m.t_sampled_image_3d() : m.t_sampled_image(), tex_var[i.tex]);
-    const uint32_t cty = is_3d ? tv3 : tv2;
-    uint32_t coord = is_3d ? shuffle(tv3, coord_v4, coord_v4, {0, 1, 2}) : shuffle(tv2, coord_v4, coord_v4, {0, 1});
+    const bool vec3_coord = is_3d || is_cube;
+    const uint32_t img = load(is_cube ? m.t_sampled_image_cube()
+                              : is_3d ? m.t_sampled_image_3d()
+                                      : m.t_sampled_image(),
+                              tex_var[i.tex]);
+    const uint32_t cty = vec3_coord ? tv3 : tv2;
+    uint32_t coord = vec3_coord ? shuffle(tv3, coord_v4, coord_v4, {0, 1, 2}) : shuffle(tv2, coord_v4, coord_v4, {0, 1});
     const uint32_t r = m.id();
     if (mode == 1) {  // TXP: divide by w (w == 0 treated as 1)
       coord = op2(OpVectorTimesScalar, cty, coord, safe_inv_w());

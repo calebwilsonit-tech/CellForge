@@ -461,7 +461,25 @@ void clear_depth(const DrawEnv& env, uint32_t mask) {
     }
 }
 
+uint32_t TexUnit::cube_face_stride() const {
+  const uint32_t mips = std::max(1u, mipmap);
+  uint32_t total = 0;
+  uint32_t mw = width, mh = height;
+  const bool dxt = (format == 0x86 || format == 0x87 || format == 0x88);
+  const uint32_t bpp = texel_bytes(format);
+  for (uint32_t m = 0; m < mips; ++m) {
+    if (dxt) total += ((mw + 3) / 4) * ((mh + 3) / 4) * (format == 0x86 ? 8u : 16u);
+    else if (linear_layout) total += (pitch ? pitch : mw * bpp) * mh;
+    else total += std::bit_ceil(mw) * std::bit_ceil(mh) * bpp;
+    if (mw == 1 && mh == 1) break;
+    mw = std::max(1u, mw >> 1);
+    mh = std::max(1u, mh >> 1);
+  }
+  return (total + 127u) & ~127u;
+}
+
 uint32_t TexUnit::byte_size() const {
+  if (cubemap) return 6u * cube_face_stride();
   const uint32_t d = is_3d() ? depth : 1u;
   if (format == 0x86 || format == 0x87 || format == 0x88)
     return ((width + 3) / 4) * ((height + 3) / 4) * d * (format == 0x86 ? 8u : 16u);
@@ -471,6 +489,22 @@ uint32_t TexUnit::byte_size() const {
 }
 
 void decode_texture_rgba(const TexUnit& t, std::vector<uint32_t>& out) {
+  if (t.cubemap) {
+    const uint32_t stride = t.cube_face_stride();
+    const size_t face_px = size_t(t.width) * t.height;
+    out.resize(face_px * 6);
+    std::vector<uint32_t> face_buf;
+    TexUnit f = t;
+    f.cubemap = false;
+    f.dimension = 2;
+    f.depth = 1;
+    for (uint32_t face = 0; face < 6; ++face) {
+      f.base = t.base + size_t(face) * stride;
+      decode_texture_rgba(f, face_buf);
+      std::memcpy(out.data() + face * face_px, face_buf.data(), face_px * 4);
+    }
+    return;
+  }
   const uint32_t depth = t.is_3d() ? t.depth : 1u;
   out.resize(size_t(t.width) * t.height * depth);
   auto q = [](float f) { return uint32_t(std::clamp(f, 0.0f, 1.0f) * 255.0f + 0.5f); };
@@ -686,11 +720,13 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
     tu.format = gcm & ~0x60u;
     tu.linear_layout = (gcm & 0x20) != 0;
     tu.unnormalized = (gcm & 0x40) != 0;
+    tu.cubemap = ((t[1] >> 2) & 1) != 0;
     tu.dimension = (t[1] >> 4) & 0xF;
     if (tu.dimension == 0) tu.dimension = 2;
+    tu.mipmap = std::max(1u, (t[1] >> 16) & 0xF);
     tu.width = std::max(1u, t[6] >> 16);
     tu.height = std::max(1u, t[6] & 0xFFFF);
-    tu.depth = tu.dimension == 3 ? std::max(1u, (r[m::TEXTURE_CONTROL3 + u] >> 20) & 0xFFFu) : 1u;
+    tu.depth = tu.is_3d() ? std::max(1u, (r[m::TEXTURE_CONTROL3 + u] >> 20) & 0xFFFu) : 1u;
     if (tu.linear_layout) tu.pitch = r[m::TEXTURE_CONTROL3 + u] & 0xFFFFF;  // row pitch in bytes
     static constexpr uint32_t kSupported[] = {0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x8B, 0x8F, 0x90, 0x91,
                                               0x92, 0x94, 0x95, 0x97, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F};
@@ -711,6 +747,9 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
     const uint32_t min_f = (t[5] >> 16) & 7;
     tu.mag_linear = (mag_f == 2 || mag_f == 4);
     tu.min_linear = (min_f == 2 || min_f == 4 || min_f == 6 || min_f == 7);
+    tu.use_mip = (min_f >= 3 && min_f <= 6) && tu.mipmap > 1;
+    tu.mip_linear = (min_f == 5 || min_f == 6);
+    tu.lod_bias = float(int32_t((t[5] & 0x1FFFu) << 19) >> 19) / 256.0f;
     tu.bilinear = tu.mag_linear || tu.min_linear;
     tu.address = env.to_address(t[0], loc);
     tu.base = tu.address ? env.mem + tu.address : nullptr;

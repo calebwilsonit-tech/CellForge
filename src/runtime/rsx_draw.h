@@ -65,14 +65,20 @@ struct TexUnit {
   uint32_t address = 0;  // guest address (for caching / overlap checks)
   uint32_t format = 0, width = 1, height = 1, depth = 1, pitch = 0;
   uint32_t dimension = 2;  // 1=1D, 2=2D, 3=3D
+  uint32_t mipmap = 1;     // RSX mipmap level count (1..13)
+  bool cubemap = false;
   bool linear_layout = false, unnormalized = false;
   uint32_t wrap_s = 1, wrap_t = 1, wrap_r = 1;
   uint32_t gamma = 0, zfunc = 7, border_color = 0;
   bool bilinear = false, mag_linear = false, min_linear = false;
-  bool is_3d() const { return dimension == 3; }
+  bool use_mip = false, mip_linear = false;
+  float lod_bias = 0.0f;
+  bool is_3d() const { return dimension == 3 && !cubemap; }
+  bool is_cube() const { return cubemap; }
   bool is_depth_fmt() const { return format == 0x8F || format == 0x90 || format == 0x91 || format == 0x92; }
-  bool is_shadow() const { return !is_3d() && is_depth_fmt() && zfunc != 7; }
+  bool is_shadow() const { return !is_3d() && !cubemap && is_depth_fmt() && zfunc != 7; }
   bool is_srgb() const { return (gamma & 7) != 0 && !is_depth_fmt(); }
+  uint32_t cube_face_stride() const;
   uint32_t byte_size() const;
 };
 // Decodes a whole texture into RGBA8 (R in the low byte of each u32).
