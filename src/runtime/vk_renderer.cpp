@@ -2105,7 +2105,9 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
   VkPipeline pipe = pipeline(d, use_depth, nullptr, error);
   if (!pipe) return false;
 
-  const bool dummy_color = (d.color_mask == 0 && d.pitch < d.surface_w * 4);
+  // Depth-only passes (e.g. shadow maps with color_mask == 0) must never bind a stale
+  // colour surface (such as the 1280x720 backbuffer), which would clip fh and distort Y.
+  const bool dummy_color = (d.color_mask == 0);
   Surface* color = surface(env.mem, dummy_color ? 0u : d.color_base,
                            dummy_color ? d.surface_w * 4 : d.pitch,
                            d.surface_w, d.surface_h, false, 0, d.argb);
@@ -2276,7 +2278,9 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   VkPipeline pipe = pipeline(d, use_depth, vp, error);
   if (!pipe) return false;
 
-  const bool dummy_color = (d.color_mask == 0 && d.pitch < d.surface_w * 4);
+  // Depth-only passes (e.g. shadow maps with color_mask == 0) must never bind a stale
+  // colour surface (such as the 1280x720 backbuffer), which would clip fh and distort Y.
+  const bool dummy_color = (d.color_mask == 0);
   Surface* color = surface(env.mem, dummy_color ? 0u : d.color_base,
                            dummy_color ? d.surface_w * 4 : d.pitch,
                            d.surface_w, d.surface_h, false, 0, d.argb);

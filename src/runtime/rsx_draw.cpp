@@ -662,14 +662,16 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
   const uint32_t color_fmt = surf & 0x1F, surf_type = (surf >> 8) & 0xF;
   d.depth_fmt = (surf >> 5) & 7;
   if (surf_type == 2) return fail("swizzled render targets are not supported yet");
+  const bool color_off = (r[m::COLOR_MASK] == 0 || r[m::SURFACE_COLOR_TARGET] == 0);
   d.argb = color_fmt == 8 || color_fmt == 4 || color_fmt == 5;
   const bool abgr = color_fmt == 16 || color_fmt == 14 || color_fmt == 15;
-  if (!d.argb && !abgr) return fail("only 32-bit colour render targets are supported yet");
+  if (!color_off && !d.argb && !abgr) return fail("only 32-bit colour render targets are supported yet");
   d.pitch = r[m::SURFACE_PITCH_A];
   d.color_base = env.to_address(r[m::SURFACE_COLOR_AOFFSET], r[m::CONTEXT_DMA_COLOR_A] == 0xFEED0001 ? 1 : 0);
-  if (!d.color_base || !d.pitch) return fail("no colour surface bound");
+  if (!color_off && (!d.color_base || !d.pitch)) return fail("no colour surface bound");
   d.zpitch = r[m::SURFACE_PITCH_Z];
   d.zbase = env.to_address(r[m::SURFACE_ZETA_OFFSET], r[m::CONTEXT_DMA_ZETA] == 0xFEED0001 ? 1 : 0);
+  if (color_off && (!d.zbase || !d.zpitch)) return fail("no depth surface bound");
 
   const uint32_t clip_h = r[m::SURFACE_CLIP_H], clip_v = r[m::SURFACE_CLIP_V];
   uint32_t aa_x = 1, aa_y = 1;
@@ -691,7 +693,6 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
     d.max_y = std::min(d.max_y, (int(r[m::SCISSOR_V] & 0xFFFF) + int(r[m::SCISSOR_V] >> 16)) * int(aa_y));
   }
   const uint32_t zbpp = d.depth_fmt == 1 ? 2 : 4;
-  const bool color_off = (r[m::COLOR_MASK] == 0 || r[m::SURFACE_COLOR_TARGET] == 0);
   const uint32_t max_w = (color_off && d.zbase && d.zpitch >= zbpp) ? (d.zpitch / zbpp) : (d.pitch / 4);
   d.max_x = std::min(d.max_x, int(max_w));
   d.surface_w = std::min(d.surface_w, max_w);

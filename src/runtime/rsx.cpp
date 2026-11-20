@@ -328,7 +328,10 @@ void Rsx::flip(uint32_t id, bool immediate) {
   } else if (GpuRenderer* g = gpu()) {
     g->flip_async(K().base(), 0, 0, nullptr);
   }
-  const bool vblank_paced = !immediate && flip_mode.load() == 2 && !stop_;
+  const int vsync_opt = cfg::g_vsync_mode.load(std::memory_order_relaxed);
+  const int cap = cfg::g_fps_cap.load(std::memory_order_relaxed);
+  // Respect user V-Sync Off / >60 FPS / Uncapped settings instead of forcing 60 Hz VBlank stalls.
+  const bool vblank_paced = !immediate && flip_mode.load() == 2 && !stop_ && vsync_opt != 0 && (cap == 60);
   if (vblank_paced) {
     uint64_t vb = stats.vblanks.load();
     if (vb == last_flip_vblank_) {
@@ -342,7 +345,6 @@ void Rsx::flip(uint32_t id, bool immediate) {
   }
   // Only apply the software FPS cap when VBlank isn't already pacing at 60 Hz;
   // use a high-resolution timer on Windows so sleeps don't quantize to 15.6 ms ticks.
-  const int cap = cfg::g_fps_cap.load(std::memory_order_relaxed);
   if (cap > 0 && !(vblank_paced && cap == 60) && !stop_) {
     const uint64_t target_us = 1000000ull / uint64_t(cap);
     const uint64_t now_us = lv2::system_time_us();
