@@ -34,7 +34,8 @@ void set_provider(Provider p);
 // left at zero are derived from the digital buttons.
 PadState read(int port);
 
-// DualSense / DualShock 4 number `index` over HID (hid_pad.cpp). False if absent.
+// HID controllers (DualSense / DualShock 4 / generic USB & Bluetooth HID gamepads).
 bool sony_pad_read(int index, PadState& out);
+int sony_pad_count();
 
 }  // namespace input

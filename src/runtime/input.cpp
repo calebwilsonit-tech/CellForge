@@ -48,13 +48,25 @@ uint8_t axis(SHORT v, bool invert) {
 }
 
 bool xinput_provider(int port, PadState& s) {
-  // PlayStation controllers (DualSense / DualShock 4 over HID) take the first
-  // ports; Xbox-style XInput pads fill in after them.
+  // HID controllers (DualSense, DualShock 4, Switch Pro, 8BitDo, generic USB/BT gamepads)
+  // take the first ports; XInput controllers (Xbox USB/BT) fill in after them.
   if (sony_pad_read(port, s)) return true;
   auto get = xinput();
-  if (!get || port >= 4) return false;
+  if (!get) return false;
+  const int xi_target = port - sony_pad_count();
+  if (xi_target < 0 || xi_target >= 4) return false;
+  // Scan all 4 XInput slots and compact connected pads so a Bluetooth Xbox controller
+  // that reconnects on slot 1/2/3 still maps to Player 1 when slot 0 is empty.
   XState st{};
-  if (get(DWORD(port), &st) != 0) return false;
+  int found = 0;
+  bool ok = false;
+  for (DWORD slot = 0; slot < 4; ++slot) {
+    if (get(slot, &st) == 0) {
+      if (found == xi_target) { ok = true; break; }
+      ++found;
+    }
+  }
+  if (!ok) return false;
   const WORD b = st.pad.buttons;
   s.connected = true;
   if (b & 0x0001) s.digital1 |= UP;
