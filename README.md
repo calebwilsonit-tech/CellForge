@@ -94,18 +94,26 @@ Skate3-VK.exe <EBOOT.ELF> [--game-root <dir>] [--data <saves dir>] [--mods <dir>
   - Function discovery via entry OPD, full-image OPD scan, `bl` targets, and explicit `--func` seeds; absolute and TOC-relative `switch` jump tables.
   - Incremental `--split N` output (only changed chunks are rewritten). *Skate 3* (`BLUS30464`): 83,310 functions, 0 warnings, 211 files.
 - **SPU AVX2 JIT & Interpreter (`src/spu`, `src/runtime/lv2_spu.cpp`, `hle_spurs.cpp`)**:
-  - Full SPU ISA interpreter paired with a native **x86-64 AVX2 SPU JIT** (`spu_jit.cpp`) for full-speed SPU job execution and VP6 video/audio decoding.
+  - Full SPU ISA interpreter paired with a native **x86-64 AVX2 SPU JIT** (`spu_jit.cpp`) featuring per-4KB-page Local Store invalidation, a 16 MB code buffer, and a content-addressed block cache for fast SPURS job switching and VP6 video/audio decoding.
   - LV2 SPU thread groups (`sys_spu_image_import`, create/start/join/terminate, MFC DMA GET/PUT/lists, `GETLLAR`/`PUTLLC`/`PUTLLUC` lock-line atomics, mailboxes, signal notification, `0xF0000000` LS window, event ports/queues) and SPURS workload scheduling.
 - **RSX Vulkan GPU Renderer & Presenter (`src/runtime/rsx*.cpp`, `spirv_gen.cpp`, `vk_renderer.cpp`, `src/gfx`)**:
-  - Direct RSX vertex- and fragment-program translation to SPIR-V (no external shader compiler), GPU-resident render targets with lazy readback, cached pipelines/shaders/samplers/textures, and automatic fallback to the CPU reference renderer (`--cpu-render`).
-  - Vulkan window presenter (`vk_presenter.cpp`) preferring discrete GPUs, with `ICON0.PNG` window/taskbar icons and Windows 11 dark title bar support.
+  - Direct RSX vertex- and fragment-program translation to SPIR-V (no external shader compiler), including GPU vertex program flow control (`BRA`/`BRI`/`BRB`/`RET`), `DDX`/`DDY`, hardware `D32_SFLOAT_S8_UINT` depth+stencil, dynamic VSM character/NPC shadows + full-distance shadow cascades (`D24S8` stencil sampling and `A8B8G8R8 -> Y16_X16` conversion), and native BC1–BC3 texture uploads.
+  - High-throughput draw path (~54–60 FPS in *Skate 3* gameplay on RTX 4060 Laptop GPU): `UNIFORM_BUFFER_DYNAMIC` with per-frame descriptor set caching, deduplicated Vulkan pipeline/state commands, O(1) u16 index remapping & specialized vertex packing, surface address-range culling, GPU-resident render targets with lazy readback, and automatic fallback to the CPU reference renderer (`--cpu-render`).
+  - Vulkan window presenter (`vk_presenter.cpp`) preferring discrete GPUs, with `ICON0.PNG` window/taskbar icons, live FPS title counter, and Windows 11 dark title bar support.
+- **Universal Controller Input (`src/runtime/input.cpp`, `hid_pad.cpp`, `hle_pad.cpp`)**:
+  - Works out of the box with **any** USB or Bluetooth controller on Windows — no Steam Input or DS4Windows required:
+    - Native Sony HID for **DualSense, DualSense Edge, and DualShock 4** (USB & Bluetooth)
+    - Compacted 4-slot **XInput** for Xbox One/Series & XInput controllers (USB & Bluetooth, even when reconnecting on slot 1–3)
+    - Descriptor-driven **generic Windows HID** parser for Nintendo Switch Pro, 8BitDo, Logitech, Stadia, and third-party USB/Bluetooth gamepads
 - **Audio (`audio.cpp`, `audio_wasapi.cpp`, `hle_audio.cpp`)**:
   - `cellAudio` 2/8-channel ports mixed every 5.33 ms at 48 kHz with 8-channel stereo downmix, port levels, notify queues, and `AddData`, outputting directly via Windows WASAPI.
 - **OS / HLE Layer (`src/runtime`)**:
-  - `sceLibStub` import resolution with SHA-1 NIDs (`nid_names.inc`), LV2 syscalls (`lv2.cpp` — host threads, mutexes, conds, semaphores, event queues/ports, timers, memory, TTY), `sysPrxForUser`, `cellSysmodule`, `cellSysutil`, VFS (`/dev_bdvd`, `/app_home`, `/dev_hdd0`, `/dev_hdd1`, `/dev_usb000`), `cellSaveData`, `cellGame`, `cellRtc`, and XInput `cellPad`.
+  - `sceLibStub` import resolution with SHA-1 NIDs (`nid_names.inc`), LV2 syscalls (`lv2.cpp` — host threads, mutexes, conds, semaphores, event queues/ports, timers, memory, TTY), `sysPrxForUser`, `cellSysmodule`, `cellSysutil`, VFS (`/dev_bdvd`, `/app_home`, `/dev_hdd0`, `/dev_hdd1`, `/dev_usb000`), `cellSaveData`, `cellGame`, `cellRtc`, and universal `cellPad`.
   - Memory map: HLE data `0x2F000000`, heap `0x30000000` (~213 MB), mmapper `0x40000000+`, RSX local memory `0xC0000000`, stacks/TLS `0xD0000000`, SPU LS window `0xF0000000`.
 
-### Debug Environment Variables
+### Debug & Profiling Environment Variables
+- `PS3RECOMP_PROFILE=<file.txt>` — enable sampling CPU/GPU/syscall profiler (analyze with `python tools/profile_report.py <file.txt> <game.map> 20`)
+- `PS3RECOMP_FPS_LOG=1` — log live 2-second FPS, draws/frame, and any GPU draw fallback reasons
 - `PS3RECOMP_RSX_TRACE=1` — per-second RSX counters, first use of every method, initial draw vertices/programs
 - `PS3RECOMP_SYSCALL_TRACE=1` — first 400 syscalls with arguments, caller (`LR`), and timestamp
 - `PS3RECOMP_DUMP_FRAME=<file.bmp>[,<flip>]` — save a presented frame to disk
@@ -127,7 +135,7 @@ Use the standalone **[CellForge Mod SDK](mod_sdk/README.md)** (`mod_sdk/`) to sc
 The single-header SDK ([mod_sdk/include/cellforge_mod.h](mod_sdk/include/cellforge_mod.h)) provides `CELLFORGE_MOD_ENTRY`, RAII function hooking (`cellforge::Hook`), big-endian PS3 guest memory helpers, wildcard pattern scanning, and an `.ini` config reader. Drop compiled `.dll` files into the game's `mods/` folder to load them automatically on startup, and toggle or configure them from the in-game **Settings → Mods** menu (`F1`). Pass `--no-mods` to disable mods or `--no-hooks` to `ps3recomp` to emit direct calls.
 
 ### Included Mods (`mod_sdk/mods/`)
-- **`skate3_online`** — Native Winsock2 UDP multiplayer mod (Direct P2P `host`/`join` or `relay_server.py` room codes) with 60 Hz skater kinematics, quaternion NLERP interpolation, and an in-game **`F6`** dark-mode Lobby & Chat panel.
+- **`skate3_online`** — Native Winsock2 UDP multiplayer mod with an in-game **`F6`** dark-mode Lobby & Chat panel, 60 Hz skater kinematics, and quaternion NLERP interpolation. Selecting `host` automatically launches `relay_server.py` **headless** (no terminal window, auto-closed via Windows Job Object on exit) on UDP `37464` so friends can join by IP + room code with just one forwarded UDP port.
 - **`skate3_trick_timer`** — Draggable, always-on-top **`F7`** Speedrun Split Timer & Line Tracker HUD (`F8` Split, `F9` Pause, `F10` Reset) with automatic Personal Best (`PB`) deltas.
 - **`skate3_clip_studio`** — Instant lossless PNG screenshot (`F12`), trick-sequence burst mode (`F11`), and **`F5`** Clip Studio control panel saving directly to `%USERPROFILE%\Pictures\Skate3-VK\`.
 
@@ -137,6 +145,6 @@ The single-header SDK ([mod_sdk/include/cellforge_mod.h](mod_sdk/include/cellfor
 
 - Guests are assumed to return via `blr` (no `setjmp`/`longjmp` or unusual LR manipulation).
 - `VSCR[SAT]` is not updated by saturating vector ops; FP record forms do not update `CR1`; FPSCR exceptions and non-default rounding modes are not modelled.
-- RSX: shader flow control (branching/loops/condition codes), vertex textures, points/lines, stencil, MRT, swizzled/tiled/16-bit render targets, 3D/fp16 register aliasing, and `DDX`/`DDY` are still in progress.
+- RSX: fragment shader branching/loops, vertex subroutines (`CAL`/`CLI`/`CLB`), vertex textures, points/lines on GPU, MRT, swizzled/tiled/16-bit render targets, and 3D/fp16 register aliasing are still in progress.
 - Audio: streams other than 48 kHz are not resampled; surround output is downmixed to stereo.
-- Raw SPUs, SPURS task ELFs inside tasksets, hardware audio/video decoders (`cellAdec`), async/stream file I/O (`cellFsAio*`, `cellFsStRead*`), keyboard/mouse input, runtime PRX loading, and network sockets (`sys_net`) are stubbed or not yet implemented.
+- Raw SPUs, SPURS task ELFs inside tasksets, hardware audio/video decoders (`cellAdec`), async/stream file I/O (`cellFsAio*`, `cellFsStRead*`), keyboard/mouse input, runtime PRX loading, and PS3 network sockets (`sys_net` / `sceNp`) are stubbed or not yet implemented.

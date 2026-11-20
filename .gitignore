@@ -24,10 +24,11 @@ CMakeUserPresets.json
 *.raw
 *.wav
 
-# Local user configs & saves
+# Local user configs, saves, & agent handoff notes
 builder.ini
 ps3game.ini
 Skate3-VK.ini
 cellforge.ini
 ps3_data/
 saves/
+AGENT_HANDOFF.md
