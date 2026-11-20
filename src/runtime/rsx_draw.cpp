@@ -707,32 +707,88 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
   const uint32_t sp = r[m::SHADER_PROGRAM];
   const uint32_t fp_addr = env.to_address(sp & ~3u, (sp & 3) == 2 ? 1 : 0);
   if (!fp_addr) return fail("no fragment program bound");
-  d.fp = decode_fp(env.mem + fp_addr);
   d.fp32_out = (r[m::SHADER_CONTROL] & 0x40) != 0;
+  uint32_t used_tex = 0;
   {
-    // Hash ONLY instruction words (excluding inline float constants, which are
-    // supplied via UBO binding 16), so animating shader constants never triggers
-    // SPIR-V / Vulkan pipeline recompilation.
-    uint64_t h = 1469598103934665603ull;
-    size_t off = 0;
-    for (const FpInsn& i : d.fp) {
-      uint64_t w01 = 0, w23 = 0;
-      std::memcpy(&w01, env.mem + fp_addr + off, 8);
-      std::memcpy(&w23, env.mem + fp_addr + off + 8, 8);
-      h = (h ^ w01) * 1099511628211ull;
-      h = (h ^ w23) * 1099511628211ull;
-      off += i.has_constant ? 32 : 16;
-      if (i.has_constant) d.fp_consts.push_back(i.constant);
-      if (i.end) break;
+    // Cache decoded fragment programs by guest address (validating instruction words)
+    // so we skip decode_fp() + FNV hashing + texture-usage scans on 99.9% of draws.
+    struct CachedFp {
+      std::vector<FpInsn> fp;
+      std::vector<uint32_t> insn_offsets;
+      std::vector<uint64_t> insn_words;  // 2x uint64_t per instruction
+      std::vector<uint32_t> const_offsets;
+      uint64_t base_hash = 0;
+      uint32_t used_tex = 0;
+    };
+    thread_local std::unordered_map<uint32_t, CachedFp> fp_cache;
+    if (fp_cache.size() > 4096) fp_cache.clear();
+    const uint8_t* base_p = env.mem + fp_addr;
+    auto it = fp_cache.find(fp_addr);
+    bool hit = false;
+    if (it != fp_cache.end()) {
+      const CachedFp& cf = it->second;
+      hit = true;
+      for (size_t k = 0; k < cf.insn_offsets.size(); ++k) {
+        uint64_t w01 = 0, w23 = 0;
+        std::memcpy(&w01, base_p + cf.insn_offsets[k], 8);
+        std::memcpy(&w23, base_p + cf.insn_offsets[k] + 8, 8);
+        if (w01 != cf.insn_words[k * 2] || w23 != cf.insn_words[k * 2 + 1]) {
+          hit = false;
+          break;
+        }
+      }
     }
-    d.fp_hash = h ^ (d.fp32_out ? 0x9E37u : 0);
+    if (hit) {
+      const CachedFp& cf = it->second;
+      d.fp = cf.fp;
+      d.fp_hash = cf.base_hash ^ (d.fp32_out ? 0x9E37u : 0);
+      used_tex = cf.used_tex;
+      d.fp_consts.reserve(cf.const_offsets.size());
+      for (uint32_t coff : cf.const_offsets) {
+        const uint8_t* cp = base_p + coff;
+        vec4 cv{};
+        for (int c = 0; c < 4; ++c) {
+          const uint32_t be = (uint32_t(cp[0]) << 24) | (uint32_t(cp[1]) << 16) | (uint32_t(cp[2]) << 8) | cp[3];
+          const uint32_t w = (be << 16) | (be >> 16);
+          cv[c] = std::bit_cast<float>(w);
+          cp += 4;
+        }
+        d.fp_consts.push_back(cv);
+      }
+    } else {
+      CachedFp cf;
+      cf.fp = decode_fp(base_p);
+      uint64_t h = 1469598103934665603ull;
+      uint32_t off = 0;
+      for (const FpInsn& i : cf.fp) {
+        uint64_t w01 = 0, w23 = 0;
+        std::memcpy(&w01, base_p + off, 8);
+        std::memcpy(&w23, base_p + off + 8, 8);
+        cf.insn_offsets.push_back(off);
+        cf.insn_words.push_back(w01);
+        cf.insn_words.push_back(w23);
+        h = (h ^ w01) * 1099511628211ull;
+        h = (h ^ w23) * 1099511628211ull;
+        if (i.has_constant) {
+          cf.const_offsets.push_back(off + 16);
+          d.fp_consts.push_back(i.constant);
+          off += 32;
+        } else {
+          off += 16;
+        }
+        if (i.op == FP_TEX || i.op == FP_TXP || i.op == FP_TXL || i.op == FP_TXB || i.op == FP_TXD)
+          cf.used_tex |= 1u << (i.tex & 15);
+        if (i.end) break;
+      }
+      cf.base_hash = h;
+      d.fp = cf.fp;
+      d.fp_hash = cf.base_hash ^ (d.fp32_out ? 0x9E37u : 0);
+      used_tex = cf.used_tex;
+      fp_cache[fp_addr] = std::move(cf);
+    }
   }
 
   // ---- textures ----
-  uint32_t used_tex = 0;
-  for (const FpInsn& i : d.fp)
-    if (i.op == FP_TEX || i.op == FP_TXP || i.op == FP_TXL || i.op == FP_TXB || i.op == FP_TXD)
-      used_tex |= 1u << (i.tex & 15);
   for (uint32_t u = 0; u < 16; ++u) {
     const uint32_t* t = r + m::TEXTURE_BASE + 8 * u;
     TexUnit& tu = d.tex[u];
@@ -889,6 +945,32 @@ bool pack_indexed_geometry(const DrawEnv& env, const DrawCall& call, uint32_t in
     rtab[slot] = {rstamp, id, loc};
     return loc;
   };
+
+  // Direct fast path for triangle lists (primitive == 5): write straight to dst_idx.
+  if (call.primitive == 5) {
+    uint32_t* o = dst_idx;
+    size_t written = 0;
+    const size_t limit = (n_raw / 3) * 3;
+    if (call.indexed) {
+      const uint32_t dma = r[m::INDEX_ARRAY_DMA];
+      const uint32_t ib = env.to_address(r[m::INDEX_ARRAY_ADDRESS], dma & 0xF);
+      if (!ib) return fail("no index buffer");
+      const bool u16 = ((dma >> 4) & 0xF) == 1;
+      const uint8_t* ibp = env.mem + ib;
+      for (const auto& [first, count] : call.ranges) {
+        for (uint32_t k = 0; k < count && written < limit; ++k, ++written) {
+          const uint8_t* p = ibp + size_t(first + k) * (u16 ? 2 : 4);
+          *o++ = intern((u16 ? be16(p) : be32(p)) + base_idx);
+        }
+      }
+    } else {
+      for (const auto& [first, count] : call.ranges)
+        for (uint32_t k = 0; k < count && written < limit; ++k, ++written) *o++ = intern(first + k);
+    }
+    if (out_vtx > max_vtx) return fail("vertex ring overflow");
+    out_idx = uint32_t(written);
+    return true;
+  }
 
   if (call.indexed) {
     const uint32_t dma = r[m::INDEX_ARRAY_DMA];

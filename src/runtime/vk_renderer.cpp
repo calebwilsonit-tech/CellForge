@@ -378,6 +378,7 @@ class VulkanRenderer final : public GpuRenderer {
   VkDeviceSize last_vp_ubo_off_ = 0;
   bool last_vp_ubo_valid_ = false;
   std::unordered_map<uint64_t, Texture> textures_;
+  std::vector<uint64_t> dynamic_tex_keys_;
   std::unordered_map<uint64_t, VkImageView> frame_tex_cache_;
   std::unordered_map<uint64_t, VkImageView> static_bc_cache_;
   uint64_t flush_seq_ = 1;
@@ -1197,6 +1198,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   tex.key = h;
   tex.last_flush = flush_seq_;
   tex.dynamic_rt = dynamic_rt;
+  if (dynamic_rt) dynamic_tex_keys_.push_back(h);
   if (t.is_shadow()) {
     // CPU-backed depth texture used with hardware shadow compare: upload as D32_SFLOAT.
     std::vector<float> zbuf(size_t(t.width) * t.height);
@@ -2138,8 +2140,7 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
     VkImageView v = resolve_gpu_tex(t, color, depth, &terr);
     if (!v && !terr.empty()) return fail(terr);
     if (!v) {
-      std::vector<Surface*> sources;
-      v = composite_sources(t, d.color_base, sources) ? composite(t, sources, &terr) : texture(t, &terr);
+      v = composite_sources(t, d.color_base, tmp_sources_) ? composite(t, tmp_sources_, &terr) : texture(t, &terr);
       if (!v) return fail(terr);
     }
     infos[u] = {sampler(t), v, VK_IMAGE_LAYOUT_GENERAL};
@@ -2254,8 +2255,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   for (const TexUnit& t : d.tex) {
     if (!t.enabled || !t.base) continue;
     if (can_gpu_tex(t, d.color_base, target_depth)) continue;
-    std::vector<Surface*> sources;
-    if (composite_sources(t, d.color_base, sources)) continue;
+    if (composite_sources(t, d.color_base, tmp_sources_)) continue;
     const uint32_t size = t.byte_size();
     for (auto& s : surfaces_) {
       if (!s->addr) continue;
@@ -2310,8 +2310,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
     VkImageView v = resolve_gpu_tex(t, color, depth, &terr);
     if (!v && !terr.empty()) return fail(terr);
     if (!v) {
-      std::vector<Surface*> sources;
-      v = composite_sources(t, d.color_base, sources) ? composite(t, sources, &terr) : texture(t, &terr);
+      v = composite_sources(t, d.color_base, tmp_sources_) ? composite(t, tmp_sources_, &terr) : texture(t, &terr);
       if (!v) return fail(terr);
     }
     infos[u] = {sampler(t), v, VK_IMAGE_LAYOUT_GENERAL};
@@ -2678,12 +2677,19 @@ void VulkanRenderer::write_back(uint8_t* mem, const Buffer& readback,
 void VulkanRenderer::evict_textures() {
   ++flush_seq_;
   frame_tex_cache_.clear();
-  for (auto it = textures_.begin(); it != textures_.end();) {
-    if (it->second.dynamic_rt && flush_seq_ - it->second.last_flush > 3) {
+  // O(1) eviction of dynamic RT-backed textures instead of scanning all 8,000+ static textures every frame.
+  for (size_t i = 0; i < dynamic_tex_keys_.size();) {
+    auto it = textures_.find(dynamic_tex_keys_[i]);
+    if (it == textures_.end()) {
+      dynamic_tex_keys_[i] = dynamic_tex_keys_.back();
+      dynamic_tex_keys_.pop_back();
+    } else if (flush_seq_ - it->second.last_flush > 3) {
       free_image(it->second.image);
-      it = textures_.erase(it);
+      textures_.erase(it);
+      dynamic_tex_keys_[i] = dynamic_tex_keys_.back();
+      dynamic_tex_keys_.pop_back();
     } else {
-      ++it;
+      ++i;
     }
   }
   if (textures_.size() <= 8192) return;
@@ -2703,6 +2709,7 @@ void VulkanRenderer::evict_textures() {
     vk_.vkDeviceWaitIdle(device_);
     for (auto& [k, t] : textures_) free_image(t.image);
     textures_.clear();
+    dynamic_tex_keys_.clear();
     static_bc_cache_.clear();
   }
 }

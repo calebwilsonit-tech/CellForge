@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <immintrin.h>
 
 #include "lv2.h"
 #include "options.h"
@@ -427,9 +428,19 @@ void Rsx::present_display(const DisplayBuffer& d, uint32_t base, uint64_t flip_n
   // Guest pixels are A8R8G8B8 stored big-endian; as a host u32 B,G,R,A that is
   // simply the loaded value with alpha forced opaque.
   const uint8_t* mem = K().base();
-  for (uint32_t y = 0; y < d.height; ++y)
-    for (uint32_t x = 0; x < d.width; ++x)
-      frame_[size_t(y) * d.width + x] = ppu::ld32(mem, base + y * d.pitch + x * 4) | 0xFF000000u;
+  const __m128i bswap = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+  const __m128i alpha_ff = _mm_set1_epi32(int(0xFF000000u));
+  for (uint32_t y = 0; y < d.height; ++y) {
+    const uint8_t* src = mem + base + size_t(y) * d.pitch;
+    uint32_t* dst = frame_.data() + size_t(y) * d.width;
+    uint32_t x = 0;
+    for (; x + 4 <= d.width; x += 4) {
+      const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + x * 4));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + x), _mm_or_si128(_mm_shuffle_epi8(v, bswap), alpha_ff));
+    }
+    for (; x < d.width; ++x)
+      dst[x] = ppu::ld32(mem, base + y * d.pitch + x * 4) | 0xFF000000u;
+  }
   if (dumping_now) {
     if (std::FILE* f = std::fopen(dump_file.c_str(), "wb")) {
       const uint32_t w = d.width, h = d.height, img = w * h * 4;
