@@ -461,6 +461,35 @@ bool build(const Settings& s, const fs::path& repo_hint, const Log& log, std::at
   const bool has_ico = fs::exists(icon0, ec) && write_ico_from_png(icon0, ico);
 
   log("== 2/4  Configuring native x64 build");
+  // If the repo or build folder was moved since the last build, wipe the stale CMake cache
+  // so CMake doesn't abort with "CMakeCache.txt directory is different".
+  const fs::path cache_file = bld / "CMakeCache.txt";
+  if (fs::exists(cache_file, ec)) {
+    std::ifstream cf(cache_file);
+    std::string line;
+    const std::string want = fs::weakly_canonical(st.repo_dir, ec).generic_string();
+    bool stale = false;
+    while (std::getline(cf, line)) {
+      if (line.rfind("CMAKE_HOME_DIRECTORY:INTERNAL=", 0) == 0) {
+        std::string cur = line.substr(30);
+        auto eq_ci = [](const std::string& a, const std::string& b) {
+          if (a.size() != b.size()) return false;
+          for (size_t i = 0; i < a.size(); ++i)
+            if (std::tolower(uint8_t(a[i])) != std::tolower(uint8_t(b[i]))) return false;
+          return true;
+        };
+        if (!want.empty() && !eq_ci(cur, want)) stale = true;
+        break;
+      }
+    }
+    cf.close();
+    if (stale) {
+      log("Detected moved build folder — resetting stale CMakeCache.txt");
+      fs::remove(cache_file, ec);
+      fs::remove_all(bld / "CMakeFiles", ec);
+      fs::remove_all(bld / "_deps", ec);
+    }
+  }
   std::vector<std::wstring> cfg = {
       L"-S", st.repo_dir.wstring(), L"-B", bld.wstring(),
       L"-G", L"Visual Studio 17 2022", L"-A", L"x64",
