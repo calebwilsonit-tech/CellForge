@@ -162,7 +162,7 @@ int main(int argc, char** argv) {
     cfg::show_settings_dialog(cfg::ini_path());
     return 0;
   }
-  if (opt.elf_path.empty()) auto_discover(opt);
+  if (opt.elf_path.empty() || opt.data_root.empty() || opt.game_root.empty()) auto_discover(opt);
   if (opt.elf_path.empty()) {
     std::fprintf(stderr, "usage: %s <EBOOT.ELF> [--mods dir | --no-mods] [--strict] [-- args...]\n", argv[0]);
     return 2;

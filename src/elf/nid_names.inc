@@ -36,6 +36,7 @@ N(cellAudioOutGetSoundAvailability) N(cellAudioOutGetSoundAvailability2) N(cellA
 N(cellAudioOutGetDeviceInfo) N(cellMsgDialogOpen2) N(cellMsgDialogClose) N(cellMsgDialogAbort)
 N(cellMsgDialogProgressBarInc) N(cellMsgDialogProgressBarSetMsg) N(cellSaveDataListLoad2) N(cellSaveDataListSave2)
 N(cellSaveDataAutoLoad2) N(cellSaveDataAutoSave2) N(cellSaveDataFixedLoad2) N(cellSaveDataFixedSave2)
+N(cellSaveDataListAutoLoad) N(cellSaveDataListAutoSave)
 N(cellSaveDataDelete2) N(cellOskDialogLoadAsync) N(cellOskDialogUnloadAsync) N(cellGameBootCheck)
 N(cellGameDataCheck) N(cellGameContentPermit) N(cellGameGetParamInt) N(cellGameGetParamString)
 N(cellGameGetSizeKB) N(cellGameCreateGameData) N(cellGameGetLocalWebContentPath) N(cellHddGameCheck)

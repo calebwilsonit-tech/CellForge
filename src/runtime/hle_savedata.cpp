@@ -304,21 +304,37 @@ void cellSaveDataListLoad2(ppu::Context& c) { c.r[3] = list_op(c, false); }
 void cellSaveDataListSave2(ppu::Context& c) { c.r[3] = list_op(c, true); }
 
 // FixedLoad2/FixedSave2(version, setList, setBuf, funcFixed, funcStat, funcFile, container, userdata)
-uint32_t fixed_op(ppu::Context& c, bool save) {
+uint32_t fixed_op_impl(bool save, uint32_t setList, uint32_t setBuf, uint32_t funcFixed, uint32_t funcStat,
+                       uint32_t funcFile, uint32_t userdata, const char* tag) {
   Scratch s;
-  K().w32(s.result + 16, a32(c, 7));
+  K().w32(s.result + 16, userdata);
   std::vector<std::string> dirs;
-  const uint32_t used = fill_list(s, a32(c, 1), a32(c, 2), dirs);
-  const int32_t r = call_cb(a32(c, 3), {s.result, s.listGet, s.fixedSet}, s.result);
-  if (r < 0) { K().logf("cellSaveDataFixed%s: fixed callback returned %d", save ? "Save" : "Load", r); return kErrCbResult; }
+  const uint32_t used = fill_list(s, setList, setBuf, dirs);
+  const int32_t r = call_cb(funcFixed, {s.result, s.listGet, s.fixedSet}, s.result);
+  if (r < 0) { K().logf("%s: fixed callback returned %d", tag, r); return kErrCbResult; }
   const std::string dir = cstr(K().r32(s.fixedSet), 32);
-  K().logf("cellSaveDataFixed%s: prefix '%s', %zu dir(s), fixed cb -> %d -> '%s'", save ? "Save" : "Load",
-           cstr(K().r32(a32(c, 1) + 8), 256).c_str(), dirs.size(), r, dir.c_str());
+  K().logf("%s: prefix '%s', %zu dir(s), fixed cb -> %d -> '%s'", tag,
+           cstr(K().r32(setList + 8), 256).c_str(), dirs.size(), r, dir.c_str());
+  if (r == kOkLast || r == kOkLastNoConfirm) return 0;
   if (dir.empty()) return kErrParam;
-  return run_dir(s, dir, save, a32(c, 2), a32(c, 4), a32(c, 5), a32(c, 7), (used + 15) & ~15u);
+  return run_dir(s, dir, save, setBuf, funcStat, funcFile, userdata, (used + 15) & ~15u);
 }
-void cellSaveDataFixedLoad2(ppu::Context& c) { c.r[3] = fixed_op(c, false); }
-void cellSaveDataFixedSave2(ppu::Context& c) { c.r[3] = fixed_op(c, true); }
+void cellSaveDataFixedLoad2(ppu::Context& c) {
+  c.r[3] = fixed_op_impl(false, a32(c, 1), a32(c, 2), a32(c, 3), a32(c, 4), a32(c, 5), a32(c, 7), "cellSaveDataFixedLoad2");
+}
+void cellSaveDataFixedSave2(ppu::Context& c) {
+  c.r[3] = fixed_op_impl(true, a32(c, 1), a32(c, 2), a32(c, 3), a32(c, 4), a32(c, 5), a32(c, 7), "cellSaveDataFixedSave2");
+}
+
+// ListAutoLoad/ListAutoSave(version, errDialog, setList, setBuf, funcFixed, funcStat, funcFile, container, userdata)
+void cellSaveDataListAutoLoad(ppu::Context& c) {
+  const uint32_t userdata = uint32_t(K().r64(uint32_t(c.r[1]) + 0x70));
+  c.r[3] = fixed_op_impl(false, a32(c, 2), a32(c, 3), a32(c, 4), a32(c, 5), a32(c, 6), userdata, "cellSaveDataListAutoLoad");
+}
+void cellSaveDataListAutoSave(ppu::Context& c) {
+  const uint32_t userdata = uint32_t(K().r64(uint32_t(c.r[1]) + 0x70));
+  c.r[3] = fixed_op_impl(true, a32(c, 2), a32(c, 3), a32(c, 4), a32(c, 5), a32(c, 6), userdata, "cellSaveDataListAutoSave");
+}
 
 }  // namespace
 
@@ -330,6 +346,8 @@ void register_savedata_module() {
   R(cellSaveDataListSave2);
   R(cellSaveDataFixedLoad2);
   R(cellSaveDataFixedSave2);
+  R(cellSaveDataListAutoLoad);
+  R(cellSaveDataListAutoSave);
 #undef R
 }
 
