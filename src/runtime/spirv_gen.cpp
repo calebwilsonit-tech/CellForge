@@ -1200,12 +1200,13 @@ std::vector<uint32_t> spirv_convert_abgr_to_y16x16_fs() {
   const uint32_t uv2 = m.id(); Module::emit(b, OpVectorShuffle, {tv2, uv2, uv4, uv4, 0, 1});
   const uint32_t img = m.id(); Module::emit(b, OpLoad, {m.t_sampled_image(), img, tex});
   const uint32_t c = m.id(); Module::emit(b, OpImageSampleImplicitLod, {tv4, c, img, uv2});
-  // write_back (!argb): guest bytes [a, b, g, r]. texel(0x95): R = (a*256+b)/65535, G = (g*256+r)/65535.
+  // write_back (!argb): guest bytes [a, b, g, r].
+  // RSX Y16_X16 (0x95): R (X16) = lower 16 bits (g*256+r)/65535, G (Y16) = upper 16 bits (a*256+b)/65535.
   const uint32_t hi_w = m.c_float(65280.0f / 65535.0f), lo_w = m.c_float(255.0f / 65535.0f);
   const uint32_t y16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 3), hi_w), op2(OpFMul, tf, ext(c, 2), lo_w));
   const uint32_t x16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 1), hi_w), op2(OpFMul, tf, ext(c, 0), lo_w));
   const uint32_t res = m.id();
-  Module::emit(b, OpCompositeConstruct, {tv4, res, y16, x16, m.c_float(0.0f), m.c_float(1.0f)});
+  Module::emit(b, OpCompositeConstruct, {tv4, res, x16, y16, m.c_float(0.0f), m.c_float(1.0f)});
   Module::emit(b, OpStore, {out_var, res});
   Module::emit(b, OpReturn, {});
   Module::emit(b, OpFunctionEnd, {});

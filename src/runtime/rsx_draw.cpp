@@ -213,7 +213,7 @@ vec4 texel(const TexUnit& t, int x, int y, int z = 0) {
     }
     case 0x8B: return {p[0] / 255.0f, p[1] / 255.0f, 0.0f, 1.0f};  // G8B8
     case 0x94: { const float v = be16(p) / 65535.0f; return {v, v, v, v}; }  // X16
-    case 0x95: return {be16(p) / 65535.0f, be16(p + 2) / 65535.0f, 0.0f, 1.0f};  // Y16_X16
+    case 0x95: { const float x16 = be16(p + 2) / 65535.0f, y16 = be16(p) / 65535.0f; return {x16, y16, x16, y16}; }  // Y16_X16
     case 0x97: {  // R5G5B5A1
       const uint16_t v = be16(p);
       return {(v >> 11) / 31.0f, ((v >> 6) & 31) / 31.0f, ((v >> 1) & 31) / 31.0f, float(v & 1)};
