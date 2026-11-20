@@ -253,7 +253,11 @@ class VulkanRenderer final : public GpuRenderer {
   // needs no readback. Keyed by (address, width, height, pitch).
   bool composite_sources(const TexUnit& t, uint32_t target_addr, std::vector<Surface*>& out);
   VkImageView composite(const TexUnit& t, const std::vector<Surface*>& sources, std::string* error);
-  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, Image> composites_;
+  struct CompositeImage {
+    Image image;
+    uint64_t sig = ~0ull;
+  };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CompositeImage> composites_;
   // Open render pass shared by consecutive draws to the same targets.
   void end_pass();
   bool pass_open_ = false;
@@ -375,6 +379,7 @@ class VulkanRenderer final : public GpuRenderer {
   bool last_vp_ubo_valid_ = false;
   std::unordered_map<uint64_t, Texture> textures_;
   std::unordered_map<uint64_t, VkImageView> frame_tex_cache_;
+  std::unordered_map<uint64_t, VkImageView> static_bc_cache_;
   uint64_t flush_seq_ = 1;
   using SamplerKey = std::tuple<bool, bool, bool, bool, int, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t, int32_t>;
   std::map<SamplerKey, VkSampler> samplers_;
@@ -740,7 +745,7 @@ void VulkanRenderer::shutdown() {
     for (auto& [k, v] : vertex_shaders_)
       if (v.mod) vk_.vkDestroyShaderModule(device_, v.mod, nullptr);
     for (auto& [k, t] : textures_) free_image(t.image);
-    for (auto& [k, img] : composites_) free_image(img);
+    for (auto& [k, c] : composites_) free_image(c.image);
     for (auto& [k, s] : samplers_) vk_.vkDestroySampler(device_, s, nullptr);
     free_image(dummy_);
     if (dummy_sampler_) vk_.vkDestroySampler(device_, dummy_sampler_, nullptr);
@@ -1064,6 +1069,7 @@ void VulkanRenderer::destroy_surface(Surface& s) {
   vk_.vkDeviceWaitIdle(device_);
   for (auto& [k, c] : converted_)
     if (std::get<0>(k) == s.addr) c.write_seq = ~0ull;
+  for (auto& [k, c] : composites_) c.sig = ~0ull;
   for (auto it = framebuffers_.begin(); it != framebuffers_.end();) {
     if (it->first.first == s.image.view || it->first.second == s.image.view) {
       vk_.vkDestroyFramebuffer(device_, it->second, nullptr);
@@ -1082,7 +1088,9 @@ void VulkanRenderer::invalidate(uint32_t addr, uint32_t size) {
       s->needs_upload = true;
       ++s->write_seq;
     }
+  for (auto& [k, c] : composites_) c.sig = ~0ull;
   frame_tex_cache_.clear();
+  static_bc_cache_.clear();
 }
 
 VkFramebuffer VulkanRenderer::framebuffer(Surface* color, Surface* depth) {
@@ -1164,8 +1172,13 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       dynamic_rt = true;
     }
   }
-  // Persistent fast path: static textures already verified skip re-hashing across frames.
-  if (!dynamic_rt) {
+  // Persistent fast path: static BC/DXT textures skip re-hashing across frames,
+  // and other non-RT textures skip re-hashing within the current frame.
+  const bool is_static_bc = !dynamic_rt && (t.format == 0x86 || t.format == 0x87 || t.format == 0x88);
+  if (is_static_bc) {
+    auto sc = static_bc_cache_.find(cache_key);
+    if (sc != static_bc_cache_.end()) return sc->second;
+  } else if (!dynamic_rt) {
     auto fc = frame_tex_cache_.find(cache_key);
     if (fc != frame_tex_cache_.end()) return fc->second;
   }
@@ -1175,7 +1188,8 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   if (it != textures_.end()) {
     it->second.last_flush = flush_seq_;
     const VkImageView view = get_view(it->second.image, false, t.remap);
-    if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+    if (is_static_bc) static_bc_cache_[cache_key] = view;
+    else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
     return view;
   }
 
@@ -1287,7 +1301,8 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
   }
@@ -1372,7 +1387,8 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
   }
@@ -1411,7 +1427,8 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
   }
@@ -1491,7 +1508,16 @@ bool VulkanRenderer::composite_sources(const TexUnit& t, uint32_t target_addr, s
 }
 
 VkImageView VulkanRenderer::composite(const TexUnit& t, const std::vector<Surface*>& sources, std::string* error) {
-  Image& img = composites_[{t.address, t.width, t.height, t.pitch}];
+  CompositeImage& ci = composites_[{t.address, t.width, t.height, t.pitch}];
+  uint64_t sig = 0x9E3779B97F4A7C15ull;
+  for (Surface* s : sources) {
+    sig ^= (uint64_t(s->addr) << 1) ^ ((s->write_seq + 1) * 0xBF58476D1CE4E5B9ull) ^ (s->needs_upload ? 1ull : 0ull);
+    sig = std::rotl(sig, 13) * 0x94D049BB133111EBull;
+  }
+  if (ci.image.img && ci.sig == sig) {
+    return get_view(ci.image, t.is_srgb(), t.remap);
+  }
+  Image& img = ci.image;
   begin();
   if (!img.img) {
     if (!make_image(img, t.width, t.height, VK_FORMAT_R8G8B8A8_UNORM,
@@ -1543,6 +1569,7 @@ VkImageView VulkanRenderer::composite(const TexUnit& t, const std::vector<Surfac
     vk_.vkCmdCopyImage(cmd_, p.s->image.img, VK_IMAGE_LAYOUT_GENERAL, img.img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
   }
   barrier_all();
+  ci.sig = sig;
   return get_view(img, t.is_srgb(), t.remap);
 }
 
@@ -2438,7 +2465,6 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
   const uint32_t x0 = (clip_h & 0xFFFF) * aa_x, w = (clip_h >> 16) * aa_x;
   const uint32_t y0 = (clip_v & 0xFFFF) * aa_y, h = (clip_v >> 16) * aa_y;
   if (!w || !h) return true;
-  if (x0 != 0 || y0 != 0) return false;  // sub-rect clears fall back to CPU
   const uint32_t surf_w_full = x0 + w, surf_h = y0 + h;
 
   Surface* color = nullptr;
@@ -2449,7 +2475,6 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
     const uint32_t sw = std::min(surf_w_full, pitch / 4);
     color = surface(env.mem, cbase, pitch, sw, surf_h, false, 0, argb);
     if (!color) return false;
-    color->needs_upload = false;
   }
 
   Surface* depth = nullptr;
@@ -2462,15 +2487,13 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
       const uint32_t zw = std::min(base_w, zpitch / bpp);
       depth = surface(env.mem, zbase, zpitch, zw, surf_h, true, depth_fmt, true);
       if (!depth) return false;
-      depth->needs_upload = false;
     }
   }
+  if (!color && !depth) return true;
 
-  begin();
-  barrier_all();
+  VkClearColorValue ccv{};
   if (color) {
     const uint32_t cv = r[m::COLOR_CLEAR_VALUE];
-    VkClearColorValue ccv{};
     if (argb) {
       ccv.float32[0] = ((cv >> 16) & 0xFF) / 255.0f;
       ccv.float32[1] = ((cv >> 8) & 0xFF) / 255.0f;
@@ -2482,19 +2505,93 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
       ccv.float32[2] = ((cv >> 16) & 0xFF) / 255.0f;
       ccv.float32[3] = (cv >> 24) / 255.0f;
     }
-    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vk_.vkCmdClearColorImage(cmd_, color->image.img, VK_IMAGE_LAYOUT_GENERAL, &ccv, 1, &range);
-    mark_dirty(color);
   }
+  VkClearDepthStencilValue dsv{};
   if (depth) {
     const uint32_t zv = r[m::ZSTENCIL_CLEAR_VALUE];
-    VkClearDepthStencilValue dsv{};
     dsv.depth = depth_fmt == 1 ? uint16_t(zv) / 65535.0f : (zv >> 8) / 16777215.0f;
-    VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-    vk_.vkCmdClearDepthStencilImage(cmd_, depth->image.img, VK_IMAGE_LAYOUT_GENERAL, &dsv, 1, &range);
-    mark_dirty(depth);
   }
-  barrier_all();
+
+  const bool full_clear =
+      x0 == 0 && y0 == 0 &&
+      (!color || (w >= color->image.w && h >= color->image.h)) &&
+      (!depth || (w >= depth->image.w && h >= depth->image.h));
+
+  if (full_clear) {
+    if (color) color->needs_upload = false;
+    if (depth) depth->needs_upload = false;
+    begin();
+    barrier_all();
+    if (color) {
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk_.vkCmdClearColorImage(cmd_, color->image.img, VK_IMAGE_LAYOUT_GENERAL, &ccv, 1, &range);
+      mark_dirty(color);
+    }
+    if (depth) {
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+      vk_.vkCmdClearDepthStencilImage(cmd_, depth->image.img, VK_IMAGE_LAYOUT_GENERAL, &dsv, 1, &range);
+      mark_dirty(depth);
+    }
+    barrier_all();
+    return true;
+  }
+
+  // Sub-rect / shadow-atlas tile clear on the GPU via vkCmdClearAttachments:
+  // preserves untouched tiles and avoids a synchronous CPU fallback + GPU flush.
+  if (color && color->needs_upload && !upload_surface(env.mem, *color)) {
+    flush_for(env.mem, false, kFlushUpload, 0, 0);
+    if (!upload_surface(env.mem, *color)) return false;
+  }
+  if (depth && depth->needs_upload && !upload_surface(env.mem, *depth)) {
+    flush_for(env.mem, false, kFlushUpload, 0, 0);
+    if (!upload_surface(env.mem, *depth)) return false;
+  }
+  Surface* fb_color = color;
+  if (!fb_color) {
+    fb_color = surface(env.mem, 0u, depth->image.w * 4, depth->image.w, depth->image.h, false, 0, true);
+    if (!fb_color) return false;
+    fb_color->needs_upload = false;
+  }
+  const uint32_t fw = depth ? std::min(fb_color->image.w, depth->image.w) : fb_color->image.w;
+  const uint32_t fh = depth ? std::min(fb_color->image.h, depth->image.h) : fb_color->image.h;
+  if (x0 >= fw || y0 >= fh) return true;
+  const uint32_t cw = std::min(w, fw - x0);
+  const uint32_t ch = std::min(h, fh - y0);
+  if (!cw || !ch) return true;
+
+  begin();
+  const VkRenderPass rp = depth ? rp_depth_ : rp_color_;
+  const VkFramebuffer fb = framebuffer(fb_color, depth);
+  if (!pass_open_ || pass_fb_ != fb || pass_rp_ != rp || pass_w_ != fw || pass_h_ != fh) {
+    barrier_all();
+    VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea = {{0, 0}, {fw, fh}};
+    vk_.vkCmdBeginRenderPass(cmd_, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    pass_open_ = true;
+    pass_fb_ = fb;
+    pass_rp_ = rp;
+    pass_w_ = fw;
+    pass_h_ = fh;
+  }
+  VkClearAttachment atts[2]{};
+  uint32_t n_att = 0;
+  if (color) {
+    atts[n_att].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    atts[n_att].colorAttachment = 0;
+    atts[n_att].clearValue.color = ccv;
+    ++n_att;
+  }
+  if (depth) {
+    atts[n_att].aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    atts[n_att].clearValue.depthStencil = dsv;
+    ++n_att;
+  }
+  VkClearRect crect{{{int32_t(x0), int32_t(y0)}, {cw, ch}}, 0, 1};
+  vk_.vkCmdClearAttachments(cmd_, n_att, atts, 1, &crect);
+  if (color) mark_dirty(color);
+  if (depth) mark_dirty(depth);
   return true;
 }
 
@@ -2587,18 +2684,22 @@ void VulkanRenderer::evict_textures() {
   }
   if (textures_.size() <= 8192) return;
   // Evict textures not used in recent flushes instead of wiping the entire cache.
+  bool evicted = false;
   for (auto it = textures_.begin(); it != textures_.end();) {
     if (flush_seq_ - it->second.last_flush > 120) {
       free_image(it->second.image);
       it = textures_.erase(it);
+      evicted = true;
     } else {
       ++it;
     }
   }
+  if (evicted) static_bc_cache_.clear();
   if (textures_.size() > 8192) {
     vk_.vkDeviceWaitIdle(device_);
     for (auto& [k, t] : textures_) free_image(t.image);
     textures_.clear();
+    static_bc_cache_.clear();
   }
 }
 
