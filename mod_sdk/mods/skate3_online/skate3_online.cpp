@@ -44,6 +44,15 @@ uint32_t g_ghost_stride = 0x40;
 std::mutex g_feed_mu;
 std::deque<std::string> g_feed;
 
+// Headless relay_server.py child process (auto-managed when mode == "host").
+std::mutex g_relay_mu;
+HANDLE g_relay_proc = nullptr;
+HANDLE g_relay_job = nullptr;
+uint16_t g_relay_port = 0;
+std::atomic<bool> g_relay_active{false};
+std::mutex g_ui_cfg_mu;
+s3net::ClientConfig g_ui_cfg;
+
 std::atomic<bool> g_ui_open{false};
 std::atomic<bool> g_hotkey_running{false};
 std::thread g_hotkey_thread;
@@ -91,7 +100,7 @@ void save_ini(const s3net::ClientConfig& c, bool show_ui) {
   if (!g_ini_path.parent_path().empty()) std::filesystem::create_directories(g_ini_path.parent_path(), ec);
   std::ofstream f(g_ini_path);
   if (!f) return;
-  f << "# Skate3-VK Online Mod (Path A: Direct P2P / UDP Relay)\n";
+  f << "# Skate3-VK Online Mod (Path A: Direct P2P / Headless UDP Relay)\n";
   f << "enabled=1\n";
   f << "show_ui_on_start=" << (show_ui ? 1 : 0) << "\n";
   f << "player_name=" << c.player_name << "\n";
@@ -107,6 +116,128 @@ void save_ini(const s3net::ClientConfig& c, bool show_ui) {
   else f << "ghost_pool_addr=\n";
   if (g_frame_hook_addr) { std::snprintf(hex, sizeof(hex), "%08X", g_frame_hook_addr); f << "frame_hook_addr=" << hex << "\n"; }
   else f << "frame_hook_addr=\n";
+}
+
+// ---- Headless relay_server.py management (Option B built into host mode) ----
+
+void stop_headless_relay() {
+  std::lock_guard<std::mutex> lk(g_relay_mu);
+  if (g_relay_proc) {
+    TerminateProcess(g_relay_proc, 0);
+    WaitForSingleObject(g_relay_proc, 500);
+    CloseHandle(g_relay_proc);
+    g_relay_proc = nullptr;
+  }
+  if (g_relay_job) {
+    CloseHandle(g_relay_job);
+    g_relay_job = nullptr;
+  }
+  g_relay_port = 0;
+  g_relay_active.store(false);
+}
+
+bool start_headless_relay(uint16_t port) {
+  {
+    std::lock_guard<std::mutex> lk(g_relay_mu);
+    if (g_relay_proc && g_relay_port == port && WaitForSingleObject(g_relay_proc, 0) == WAIT_TIMEOUT) {
+      g_relay_active.store(true);
+      return true;
+    }
+  }
+  stop_headless_relay();
+
+  const std::filesystem::path script = g_ini_path.parent_path() / "relay_server.py";
+  std::error_code ec;
+  if (!std::filesystem::exists(script, ec)) {
+    cellforge::logf("skate3_online: relay_server.py not found at %s (using direct P2P host)", script.string().c_str());
+    return false;
+  }
+
+  const std::wstring wscript = script.wstring();
+  const std::wstring wport = std::to_wstring(port);
+  const std::wstring wdir = script.parent_path().wstring();
+  const wchar_t* launchers[] = {
+      L"pythonw.exe",
+      L"python.exe",
+      L"py.exe -3",
+  };
+
+  for (const wchar_t* exe : launchers) {
+    std::wstring cmd = std::wstring(exe) + L" \"" + wscript + L"\" --port " + wport;
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                        CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, nullptr,
+                        wdir.empty() ? nullptr : wdir.c_str(), &si, &pi)) {
+      // Retry without CREATE_BREAKAWAY_FROM_JOB in case the parent job disallows breakaway.
+      if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE,
+                          CREATE_NO_WINDOW, nullptr,
+                          wdir.empty() ? nullptr : wdir.c_str(), &si, &pi)) {
+        continue;
+      }
+    }
+
+    // Bind child to a Job Object with KILL_ON_JOB_CLOSE so closing the game never leaves an orphan relay.
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli{};
+      jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      SetInformationJobObject(job, JobObjectExtendedLimitInformation, &jeli, sizeof(jeli));
+      AssignProcessToJobObject(job, pi.hProcess);
+    }
+    CloseHandle(pi.hThread);
+
+    // Wait briefly to ensure relay_server.py stays up and binds the UDP port.
+    if (WaitForSingleObject(pi.hProcess, 180) == WAIT_TIMEOUT) {
+      std::lock_guard<std::mutex> lk(g_relay_mu);
+      g_relay_proc = pi.hProcess;
+      g_relay_job = job;
+      g_relay_port = port;
+      g_relay_active.store(true);
+      cellforge::logf("skate3_online: started headless relay_server.py on UDP :%u", unsigned(port));
+      push_feed("[relay] Started headless relay on UDP :" + std::to_string(port));
+      return true;
+    }
+
+    // Process exited immediately (e.g. launcher stub or port in use); clean up and try next.
+    CloseHandle(pi.hProcess);
+    if (job) CloseHandle(job);
+  }
+
+  cellforge::log("skate3_online: could not launch headless relay_server.py (Python not found); falling back to direct P2P host");
+  return false;
+}
+
+bool start_session(const s3net::ClientConfig& ui_cfg) {
+  {
+    std::lock_guard<std::mutex> lk(g_ui_cfg_mu);
+    g_ui_cfg = ui_cfg;
+  }
+
+  s3net::ClientConfig eff = ui_cfg;
+  if (ui_cfg.mode == "host") {
+    // Stop client first so UDP port is free for the headless relay server to bind.
+    g_net.stop();
+    if (start_headless_relay(ui_cfg.port)) {
+      eff.mode = "relay";
+      eff.host = "127.0.0.1";
+    }
+  } else {
+    stop_headless_relay();
+  }
+
+  return g_net.start(eff, [](const std::string& m) {
+    cellforge::logf("skate3_online: %s", m.c_str());
+    push_feed("[net] " + m);
+  });
+}
+
+s3net::ClientConfig get_ui_cfg() {
+  std::lock_guard<std::mutex> lk(g_ui_cfg_mu);
+  return g_ui_cfg;
 }
 
 // ---- Guest RAM Sync ---------------------------------------------------------
@@ -199,10 +330,14 @@ HWND mk(HWND parent, HFONT font, const wchar_t* cls, const wchar_t* text, DWORD 
 
 void refresh_lobby_ui(LobbyUi& u) {
   const auto cfg = g_net.config();
+  const auto ucfg = get_ui_cfg();
   const auto peers = g_net.get_remote_peers();
   char buf[256];
   if (!g_net.running()) {
     std::snprintf(buf, sizeof(buf), "Status: Disconnected");
+  } else if (g_relay_active.load()) {
+    std::snprintf(buf, sizeof(buf), "Hosting (Headless Relay) UDP :%u | Room %s | Players: %zu | RTT %u ms",
+                  unsigned(ucfg.port), ucfg.room.c_str(), peers.size() + 1, unsigned(g_net.rtt_ms()));
   } else if (cfg.mode == "host") {
     std::snprintf(buf, sizeof(buf), "Hosting UDP :%u | Room %s | Players: %zu | TX %llu / RX %llu",
                   unsigned(cfg.port), cfg.room.c_str(), peers.size() + 1,
@@ -210,11 +345,11 @@ void refresh_lobby_ui(LobbyUi& u) {
                   static_cast<unsigned long long>(g_net.packets_recv()));
   } else if (g_net.local_peer_id() != 0) {
     std::snprintf(buf, sizeof(buf), "Connected (%s) | Peer #%u | Room %s | RTT %u ms | Players: %zu",
-                  cfg.mode.c_str(), unsigned(g_net.local_peer_id()), cfg.room.c_str(),
+                  ucfg.mode.c_str(), unsigned(g_net.local_peer_id()), cfg.room.c_str(),
                   unsigned(g_net.rtt_ms()), peers.size() + 1);
   } else {
     std::snprintf(buf, sizeof(buf), "Connecting (%s -> %s:%u, Room %s)...",
-                  cfg.mode.c_str(), cfg.host.c_str(), unsigned(cfg.port), cfg.room.c_str());
+                  ucfg.mode.c_str(), cfg.host.c_str(), unsigned(cfg.port), cfg.room.c_str());
   }
   SetWindowTextW(u.c_status, widen(buf).c_str());
 
@@ -264,7 +399,7 @@ LRESULT CALLBACK lobby_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       u->br_bg = CreateSolidBrush(kBg);
       u->br_card = CreateSolidBrush(kCard);
 
-      const auto cfg = g_net.config();
+      const auto cfg = get_ui_cfg();
       const int lx = 18;
       mk(hwnd, u->f_hdr, L"STATIC", L"Skate3-VK Online  (F6 to toggle)", 0, lx, 12, 480, 24);
       u->c_status = mk(hwnd, u->f_ui, L"STATIC", L"Status: Initializing...", 0, lx, 38, 500, 20);
@@ -349,7 +484,7 @@ LRESULT CALLBACK lobby_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (!u) break;
       const int id = LOWORD(wp);
       if (id == ID_RECONNECT) {
-        s3net::ClientConfig nc = g_net.config();
+        s3net::ClientConfig nc = get_ui_cfg();
         const int mi = int(SendMessageW(u->c_mode, CB_GETCURSEL, 0, 0));
         nc.mode = (mi == 1) ? "host" : (mi == 2 ? "join" : "relay");
         nc.host = get_ctrl_text(u->c_host);
@@ -363,10 +498,7 @@ LRESULT CALLBACK lobby_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         save_ini(nc, false);
         push_feed("[sys] Reconnecting (" + nc.mode + " " + nc.host + ":" + std::to_string(nc.port) + " room=" + nc.room + ")...");
-        g_net.start(nc, [](const std::string& m) {
-          cellforge::logf("skate3_online: %s", m.c_str());
-          push_feed("[net] " + m);
-        });
+        start_session(nc);
         refresh_lobby_ui(*u);
       } else if (id == ID_SEND_CHAT) {
         std::string txt = get_ctrl_text(u->c_chat);
@@ -511,10 +643,7 @@ CELLFORGE_MOD_ENTRY(api) {
     }
   });
 
-  if (!g_net.start(net_cfg, [](const std::string& m) {
-        cellforge::logf("skate3_online: %s", m.c_str());
-        push_feed("[net] " + m);
-      })) {
+  if (!start_session(net_cfg)) {
     cellforge::log("skate3_online: failed to start UDP transport");
     return 1;
   }
