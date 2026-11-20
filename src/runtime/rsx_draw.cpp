@@ -491,7 +491,7 @@ void reset_defaults(uint32_t* r) {
   r[m::BACK_STENCIL_MASK] = 0xFF;
   r[m::BACK_STENCIL_FUNC] = 0x207;
   r[m::BACK_STENCIL_FUNC_MASK] = 0xFF;
-  r[m::BACK_STENCIL_OP_FAIL] = r[m::BACK_STENCIL_OP_ZPASS] = 0x1E00;
+  r[m::BACK_STENCIL_OP_FAIL] = r[m::BACK_STENCIL_OP_ZFAIL] = r[m::BACK_STENCIL_OP_ZPASS] = 0x1E00;
   r[m::BLEND_SFACTOR] = 0x00010001;  // ONE, ONE
   r[m::BLEND_DFACTOR] = 0;           // ZERO
   r[m::BLEND_EQUATION] = 0x80068006; // ADD

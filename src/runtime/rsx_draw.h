@@ -28,11 +28,13 @@ constexpr uint32_t BLEND_ENABLE = 0xC4, BLEND_SFACTOR = 0xC5, BLEND_DFACTOR = 0x
                    STENCIL_OP_ZFAIL = 0xD0, STENCIL_OP_ZPASS = 0xD1, TWO_SIDED_STENCIL_TEST_ENABLE = 0xD2,
                    BACK_STENCIL_MASK = 0xD3, BACK_STENCIL_FUNC = 0xD4, BACK_STENCIL_FUNC_REF = 0xD5,
                    BACK_STENCIL_FUNC_MASK = 0xD6, BACK_STENCIL_OP_FAIL = 0xD7,
-                   POLY_OFFSET_FILL_ENABLE = 0xD8, BACK_STENCIL_OP_ZFAIL = 0xD8, BACK_STENCIL_OP_ZPASS = 0xD9,
+                   BACK_STENCIL_OP_ZFAIL = 0xD8, BACK_STENCIL_OP_ZPASS = 0xD9,
                    BLEND_COLOR2 = 0xDF;
 constexpr uint32_t SCISSOR_H = 0x230, SCISSOR_V = 0x231, SHADER_PROGRAM = 0x239;
 constexpr uint32_t VIEWPORT_H = 0x280, VIEWPORT_V = 0x281, VIEWPORT_OFFSET = 0x288, VIEWPORT_SCALE = 0x28C;
-constexpr uint32_t POLYGON_OFFSET_SCALE_FACTOR = 0x298, POLYGON_OFFSET_BIAS = 0x299;
+// Polygon offset: methods 0x0A78 (fill enable), 0x0A7C (scale factor), 0x0A80 (bias). The game writes
+// 0x0A78/0x0A7C during init and never touches 0x0A60/0x0A64, which these used to point at.
+constexpr uint32_t POLY_OFFSET_FILL_ENABLE = 0x29E, POLYGON_OFFSET_SCALE_FACTOR = 0x29F, POLYGON_OFFSET_BIAS = 0x2A0;
 constexpr uint32_t DEPTH_FUNC = 0x29B, DEPTH_MASK = 0x29C, DEPTH_TEST_ENABLE = 0x29D;
 constexpr uint32_t TRANSFORM_PROGRAM = 0x2E0;  // 32-word window
 constexpr uint32_t VERTEX_ARRAY_OFFSET = 0x5A0, VERTEX_ARRAY_FORMAT = 0x5D0;  // 16 each

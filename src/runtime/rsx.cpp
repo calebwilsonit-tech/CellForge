@@ -525,6 +525,14 @@ void Rsx::execute(uint32_t method, uint32_t value) {
       seen[(method & 0xFFFC) / 4] = true;
       k.logf("rsx trace: first method 0x%04X = 0x%08X", method, value);
     }
+    // Polygon offset (0x0A78 enable, 0x0A7C scale, 0x0A80 bias): log every distinct value.
+    if ((method & 0xFFFC) == 0x0A68 || ((method & 0xFFFC) >= 0x0A78 && (method & 0xFFFC) <= 0x0A80)) {
+      static uint32_t last[0x30] = {};
+      static int logged = 0;
+      uint32_t& l = last[((method & 0xFFFC) - 0x0A60) / 4];
+      if (l != value && logged++ < 60) k.logf("rsx trace: poly-offset reg 0x%04X = 0x%08X", method, value);
+      l = value;
+    }
   }
   switch (method) {
     case M_SET_REFERENCE:
