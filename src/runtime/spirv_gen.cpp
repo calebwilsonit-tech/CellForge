@@ -17,12 +17,13 @@ enum : uint32_t {
   OpFunction = 54, OpFunctionEnd = 56, OpVariable = 59, OpLoad = 61, OpStore = 62, OpAccessChain = 65,
   OpDecorate = 71, OpMemberDecorate = 72, OpVectorShuffle = 79, OpCompositeConstruct = 80, OpCompositeExtract = 81,
   OpImageSampleImplicitLod = 87, OpImageSampleExplicitLod = 88, OpImageSampleDrefImplicitLod = 89,
-  OpImageSampleDrefExplicitLod = 90, OpConvertFToS = 110, OpFNegate = 127,
+  OpImageSampleDrefExplicitLod = 90, OpConvertFToS = 110, OpConvertUToF = 112, OpFNegate = 127,
   OpIAdd = 128, OpFAdd = 129, OpFSub = 131, OpFMul = 133, OpFDiv = 136, OpVectorTimesScalar = 142,
-  OpDot = 148, OpAny = 154, OpLogicalAnd = 167, OpSelect = 169, OpFOrdEqual = 180, OpFOrdNotEqual = 182,
-  OpFUnordNotEqual = 183, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186, OpFOrdLessThanEqual = 188,
-  OpFOrdGreaterThanEqual = 190, OpBitwiseAnd = 199, OpDPdx = 207, OpDPdy = 208, OpSelectionMerge = 247,
-  OpLabel = 248, OpBranch = 249, OpBranchConditional = 250, OpKill = 252, OpReturn = 253,
+  OpDot = 148, OpAny = 154, OpLogicalAnd = 167, OpSelect = 169, OpUGreaterThanEqual = 174, OpFOrdEqual = 180,
+  OpFOrdNotEqual = 182, OpFUnordNotEqual = 183, OpFOrdLessThan = 184, OpFOrdGreaterThan = 186,
+  OpFOrdLessThanEqual = 188, OpFOrdGreaterThanEqual = 190, OpBitwiseAnd = 199, OpDPdx = 207, OpDPdy = 208,
+  OpLoopMerge = 246, OpSelectionMerge = 247, OpLabel = 248, OpBranch = 249, OpBranchConditional = 250,
+  OpSwitch = 251, OpKill = 252, OpReturn = 253,
 };
 enum : uint32_t { SC_UniformConstant = 0, SC_Input = 1, SC_Uniform = 2, SC_Output = 3, SC_Function = 7 };
 enum : uint32_t {
@@ -67,6 +68,10 @@ class Module {
     const uint32_t s = t_s32();
     return cached(k_ivec4_, [&](uint32_t i) { emit(types_, OpTypeVector, {i, s, 4}); });
   }
+  uint32_t t_uvec4() {
+    const uint32_t u = t_u32();
+    return cached(k_uvec4_, [&](uint32_t i) { emit(types_, OpTypeVector, {i, u, 4}); });
+  }
   uint32_t t_bvec4() {
     const uint32_t b = t_bool();
     return cached(k_bvec4_, [&](uint32_t i) { emit(types_, OpTypeVector, {i, b, 4}); });
@@ -94,6 +99,11 @@ class Module {
     const uint32_t f = t_float();
     const uint32_t img = cached(k_img_cube_, [&](uint32_t i) { emit(types_, OpTypeImage, {i, f, 3, 0, 0, 0, 1, 0}); });
     return cached(k_simg_cube_, [&](uint32_t i) { emit(types_, OpTypeSampledImage, {i, img}); });
+  }
+  uint32_t t_sampled_image_uint() {
+    const uint32_t u = t_u32();
+    const uint32_t img = cached(k_uimg_, [&](uint32_t i) { emit(types_, OpTypeImage, {i, u, 1, 0, 0, 0, 1, 0}); });
+    return cached(k_usimg_, [&](uint32_t i) { emit(types_, OpTypeSampledImage, {i, img}); });
   }
   uint32_t t_ptr(uint32_t storage, uint32_t type) {
     auto key = std::make_pair(storage, type);
@@ -187,8 +197,9 @@ class Module {
   }
   uint32_t next_ = 1;
   uint32_t k_void_ = 0, k_bool_ = 0, k_u32_ = 0, k_s32_ = 0, k_float_ = 0, k_vec_[5] = {}, k_ivec4_ = 0,
-           k_ivec4_zero_ = 0, k_bvec4_ = 0, k_fn_ = 0, k_img_ = 0, k_simg_ = 0, k_img3d_ = 0, k_simg3d_ = 0,
-           k_img_sh_ = 0, k_simg_sh_ = 0, k_img_cube_ = 0, k_simg_cube_ = 0, k_true_ = 0, k_false_ = 0;
+           k_uvec4_ = 0, k_ivec4_zero_ = 0, k_bvec4_ = 0, k_fn_ = 0, k_img_ = 0, k_simg_ = 0, k_img3d_ = 0, k_simg3d_ = 0,
+           k_img_sh_ = 0, k_simg_sh_ = 0, k_img_cube_ = 0, k_simg_cube_ = 0, k_uimg_ = 0, k_usimg_ = 0,
+           k_true_ = 0, k_false_ = 0;
   std::map<std::pair<uint32_t, uint32_t>, uint32_t> ptrs_;
   std::map<uint32_t, uint32_t> u32s_;
   std::map<int32_t, uint32_t> s32s_;
@@ -249,8 +260,12 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
   meta = SpirvVpMeta{};
 
+  auto is_flow = [](uint8_t op) {
+    return op == VS_BRA || op == VS_BRI || op == VS_BRB || op == VS_RET;
+  };
+
   // Determine which source slots (0, 1, 2) an instruction actually reads.
-  auto src_read_mask = [](const VpInsn& i) -> uint32_t {
+  auto src_read_mask = [&](const VpInsn& i) -> uint32_t {
     uint32_t m = 0;
     switch (i.vec_op) {
       case VV_NOP: case VV_SFL: case VV_STR: break;
@@ -259,17 +274,27 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
       case VV_MAD: m |= 1u | 2u | 4u; break;
       default: m |= 1u | 2u; break;
     }
-    if (i.sca_op != VS_NOP) m |= 4u;
+    if (i.sca_op != VS_NOP && !is_flow(i.sca_op)) m |= 4u;
     return m;
   };
 
-  // ---- scan the program for registers, inputs, constants and unsupported ops ----
-  std::vector<VpInsn> prog;
+  // ---- scan reachable instructions for registers, inputs, constants and branches ----
+  std::set<uint32_t> reachable, block_starts;
+  std::vector<uint32_t> queue;
+  auto mark_pc = [&](uint32_t pc, bool is_blk_start) {
+    if (pc >= vp.program.size() || reachable.size() >= 512) return;
+    if (is_blk_start) block_starts.insert(pc);
+    if (reachable.insert(pc).second) queue.push_back(pc);
+  };
+  mark_pc(vp.start, true);
+
   std::set<uint32_t> tmps, outs;
   bool uses_areg[2] = {false, false};
   bool uses_cc[2] = {false, false};
   bool found_end = false;
-  for (uint32_t pc = vp.start; pc < vp.program.size() && prog.size() < 512; ++pc) {
+  bool has_branch = false;
+  for (size_t qi = 0; qi < queue.size(); ++qi) {
+    const uint32_t pc = queue[qi];
     const VpInsn& i = vp.program[pc];
     switch (i.vec_op) {
       case VV_NOP: case VV_MOV: case VV_MUL: case VV_ADD: case VV_MAD: case VV_DP3: case VV_DPH: case VV_DP4:
@@ -282,6 +307,7 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
     switch (i.sca_op) {
       case VS_NOP: case VS_MOV: case VS_RCP: case VS_RCC: case VS_RSQ: case VS_EXP: case VS_LOG: case VS_LIT:
       case VS_LG2: case VS_EX2: case VS_SIN: case VS_COS:
+      case VS_BRA: case VS_BRI: case VS_BRB: case VS_RET:
         break;
       default:
         return fail("vertex scalar op " + std::to_string(i.sca_op) + " has no GPU translation");
@@ -307,15 +333,30 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
       if (i.dst_tmp != 0x3F) tmps.insert(i.dst_tmp & 0x3F);
       if (i.vec_result && i.dst_out < VPO_COUNT) outs.insert(i.dst_out);
     }
-    if (i.sca_op != VS_NOP) {
+    if (i.sca_op != VS_NOP && !is_flow(i.sca_op)) {
       if (i.sca_dst_tmp != 0x3F) tmps.insert(i.sca_dst_tmp & 0x3F);
       if (!i.vec_result && i.dst_out < VPO_COUNT) outs.insert(i.dst_out);
     }
     if (i.cond_test || i.cond_update) uses_cc[i.cond_reg & 1] = true;
-    prog.push_back(i);
-    if (i.end) { found_end = true; break; }
+    if (is_flow(i.sca_op)) {
+      has_branch = true;
+      if (i.sca_op != VS_BRB && i.cond != 0 && i.cond != 7) uses_cc[i.cond_reg & 1] = true;
+      if (i.sca_op == VS_BRA || i.sca_op == VS_BRI) mark_pc(uint32_t(i.branch_target), true);
+      if (i.sca_op == VS_RET) found_end = true;
+      if (!i.end) mark_pc(pc + 1, true);
+    } else if (!i.end) {
+      mark_pc(pc + 1, false);
+    }
+    if (i.end) found_end = true;
   }
   if (!found_end) return fail("vertex program missing end marker");
+  std::vector<VpInsn> prog;
+  if (!has_branch) {
+    for (uint32_t pc = vp.start; pc < vp.program.size() && prog.size() < 512; ++pc) {
+      prog.push_back(vp.program[pc]);
+      if (vp.program[pc].end) break;
+    }
+  }
 
   for (uint32_t k = 0; k < 16; ++k)
     if (meta.in_mask & (1u << k)) meta.in_loc[k] = uint8_t(meta.in_count++);
@@ -491,13 +532,26 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
     return op2(kCmp[i.cond & 7], tbv4, cv, v0);
   };
 
-  for (const VpInsn& i : prog) {
+  auto emit_vp_insn = [&](const VpInsn& i) -> uint32_t {
     const uint32_t rmask = src_read_mask(i);
     const uint32_t a = (rmask & 1u) ? fetch_src(i, 0) : v0;
     const uint32_t b = (rmask & 2u) ? fetch_src(i, 1) : v0;
     const uint32_t c = (rmask & 4u) ? fetch_src(i, 2) : v0;
     const bool has_cond = i.cond_test && i.cond != 7;
     const uint32_t cond_bv = has_cond ? eval_cond(i) : 0;
+    // Branch condition is evaluated BEFORE either VLIW slot writes back CC.
+    uint32_t br_cond_id = 0;
+    if (is_flow(i.sca_op)) {
+      if (i.sca_op == VS_BRB || i.cond == 0) {
+        br_cond_id = m.c_bool(false);
+      } else if (i.cond == 7) {
+        br_cond_id = m.c_bool(true);
+      } else {
+        const uint32_t bv = has_cond ? cond_bv : eval_cond(i);
+        br_cond_id = m.id();
+        Module::emit(body, OpCompositeExtract, {tb, br_cond_id, bv, 0});
+      }
+    }
 
     auto store_v4 = [&](uint32_t var, uint32_t r, uint8_t mask) {
       if (!mask || (i.cond_test && i.cond == 0)) return;
@@ -578,7 +632,7 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
       if (i.cond_update) store_v4(cc_var[i.cond_reg & 1], r, i.vec_mask);
     }
 
-    if (i.sca_op != VS_NOP) {
+    if (i.sca_op != VS_NOP && !is_flow(i.sca_op)) {
       const uint32_t s = c;
       uint32_t r = v0;
       switch (i.sca_op) {
@@ -636,6 +690,92 @@ bool spirv_translate_vp(const VpState& vp, std::vector<uint32_t>& spirv, SpirvVp
       if (!i.vec_result && i.dst_out < VPO_COUNT) store_v4(out_var[i.dst_out], r, i.sca_mask);
       if (i.cond_update && i.vec_op == VV_NOP) store_v4(cc_var[i.cond_reg & 1], r, i.sca_mask);
     }
+    return br_cond_id;
+  };
+
+  if (!has_branch) {
+    for (const VpInsn& i : prog) emit_vp_insn(i);
+  } else {
+    // Build contiguous basic blocks from reachable PCs and emit an OpLoopMerge + OpSwitch dispatch.
+    struct VpBlock {
+      uint32_t start = 0;
+      uint32_t label = 0;
+      std::vector<uint32_t> pcs;
+    };
+    std::vector<VpBlock> blocks;
+    for (uint32_t pc : reachable) {
+      const bool start_new = blocks.empty() || block_starts.count(pc) || pc != blocks.back().pcs.back() + 1 ||
+                             vp.program[blocks.back().pcs.back()].end;
+      if (start_new) blocks.push_back(VpBlock{pc, m.id(), {}});
+      blocks.back().pcs.push_back(pc);
+    }
+    const uint32_t tu32 = m.t_u32();
+    const uint32_t ptr_fn_u32 = m.t_ptr(SC_Function, tu32);
+    const uint32_t pc_var = m.id(), iter_var = m.id();
+    Module::emit(vars, OpVariable, {ptr_fn_u32, pc_var, SC_Function, m.c_u32(vp.start)});
+    Module::emit(vars, OpVariable, {ptr_fn_u32, iter_var, SC_Function, u0});
+
+    const uint32_t lbl_head = m.id(), lbl_check = m.id(), lbl_switch = m.id(), lbl_default = m.id(),
+                   lbl_sel_merge = m.id(), lbl_cont = m.id(), lbl_exit = m.id();
+    Module::emit(body, OpBranch, {lbl_head});
+
+    Module::emit(body, OpLabel, {lbl_head});
+    Module::emit(body, OpLoopMerge, {lbl_exit, lbl_cont, 0});
+    Module::emit(body, OpBranch, {lbl_check});
+
+    Module::emit(body, OpLabel, {lbl_check});
+    const uint32_t it_cur = load(tu32, iter_var);
+    const uint32_t it_next = op2(OpIAdd, tu32, it_cur, u1);
+    Module::emit(body, OpStore, {iter_var, it_next});
+    const uint32_t it_over = op2(OpUGreaterThanEqual, tb, it_next, m.c_u32(2048));
+    Module::emit(body, OpBranchConditional, {it_over, lbl_exit, lbl_switch});
+
+    Module::emit(body, OpLabel, {lbl_switch});
+    const uint32_t cur_pc = load(tu32, pc_var);
+    Module::emit(body, OpSelectionMerge, {lbl_sel_merge, 0});
+    std::vector<uint32_t> sw_args = {cur_pc, lbl_default};
+    for (const VpBlock& blk : blocks) {
+      sw_args.push_back(blk.start);
+      sw_args.push_back(blk.label);
+    }
+    Module::emit(body, OpSwitch, sw_args);
+
+    Module::emit(body, OpLabel, {lbl_default});
+    Module::emit(body, OpBranch, {lbl_exit});
+
+    for (const VpBlock& blk : blocks) {
+      Module::emit(body, OpLabel, {blk.label});
+      uint32_t br_cond_id = 0;
+      for (uint32_t pc : blk.pcs) br_cond_id = emit_vp_insn(vp.program[pc]);
+      const uint32_t last_pc = blk.pcs.back();
+      const VpInsn& last = vp.program[last_pc];
+      const uint32_t fall_pc = (!last.end && reachable.count(last_pc + 1)) ? (last_pc + 1) : 0xFFFFFFFFu;
+      if (last.sca_op == VS_BRA || last.sca_op == VS_BRI) {
+        const uint32_t tgt_pc = reachable.count(uint32_t(last.branch_target)) ? uint32_t(last.branch_target) : 0xFFFFFFFFu;
+        const uint32_t next_pc = m.id();
+        Module::emit(body, OpSelect, {tu32, next_pc, br_cond_id, m.c_u32(tgt_pc), m.c_u32(fall_pc)});
+        Module::emit(body, OpStore, {pc_var, next_pc});
+        Module::emit(body, OpBranch, {lbl_sel_merge});
+      } else if (last.sca_op == VS_RET) {
+        const uint32_t next_pc = m.id();
+        Module::emit(body, OpSelect, {tu32, next_pc, br_cond_id, m.c_u32(0xFFFFFFFFu), m.c_u32(fall_pc)});
+        Module::emit(body, OpStore, {pc_var, next_pc});
+        Module::emit(body, OpBranch, {lbl_sel_merge});
+      } else if (last.end || fall_pc == 0xFFFFFFFFu) {
+        Module::emit(body, OpBranch, {lbl_exit});
+      } else {
+        Module::emit(body, OpStore, {pc_var, m.c_u32(fall_pc)});
+        Module::emit(body, OpBranch, {lbl_sel_merge});
+      }
+    }
+
+    Module::emit(body, OpLabel, {lbl_sel_merge});
+    Module::emit(body, OpBranch, {lbl_cont});
+
+    Module::emit(body, OpLabel, {lbl_cont});
+    Module::emit(body, OpBranch, {lbl_head});
+
+    Module::emit(body, OpLabel, {lbl_exit});
   }
 
   // Transform RSX clip HPOS into Vulkan clip space for the surface viewport [0..fw, 0..fh].
@@ -1114,7 +1254,8 @@ std::vector<uint32_t> spirv_convert_d24_to_argb_fs() {
     Module::emit(m.imports_, OpExtInstImport, a);
   }
   Module::emit(m.imports_, OpMemoryModel, {0, 1});
-  const uint32_t tf = m.t_float(), tv2 = m.t_vec(2), tv4 = m.t_vec(4), tvoid = m.t_void(), fnt = m.t_fn_void();
+  const uint32_t tf = m.t_float(), tv2 = m.t_vec(2), tv4 = m.t_vec(4), tu = m.t_u32(), tuv4 = m.t_uvec4(),
+                 tvoid = m.t_void(), fnt = m.t_fn_void();
   const uint32_t uv_in = m.global_var(SC_Input, tv4);
   m.decorate(uv_in, Dec_Location, 3);  // TEX0
   const uint32_t out_var = m.global_var(SC_Output, tv4);
@@ -1122,6 +1263,9 @@ std::vector<uint32_t> spirv_convert_d24_to_argb_fs() {
   const uint32_t tex = m.global_var(SC_UniformConstant, m.t_sampled_image());
   m.decorate(tex, Dec_DescriptorSet, 0);
   m.decorate(tex, Dec_Binding, 0);
+  const uint32_t tex_s = m.global_var(SC_UniformConstant, m.t_sampled_image_uint());
+  m.decorate(tex_s, Dec_DescriptorSet, 0);
+  m.decorate(tex_s, Dec_Binding, 1);
   const uint32_t main = m.id(), lbl = m.id();
   {
     std::vector<uint32_t> ep = {4, main};
@@ -1155,10 +1299,14 @@ std::vector<uint32_t> spirv_convert_d24_to_argb_fs() {
   const uint32_t d_mid = ext(G_Floor, tf, {op2(OpFMul, tf, rem1, m.c_float(1.0f / 256.0f))});
   const uint32_t d_lo = op2(OpFSub, tf, rem1, op2(OpFMul, tf, d_mid, m.c_float(256.0f)));
   const uint32_t inv255 = m.c_float(1.0f / 255.0f);
-  // Matches write_back (D24S8 big-endian [d_hi, d_mid, d_lo, 0]) read as A8R8G8B8 (R=d_mid, G=d_lo, B=0, A=d_hi).
+  const uint32_t uimg = m.id(); Module::emit(b, OpLoad, {m.t_sampled_image_uint(), uimg, tex_s});
+  const uint32_t usamp = m.id(); Module::emit(b, OpImageSampleImplicitLod, {tuv4, usamp, uimg, uv2});
+  const uint32_t su = m.id(); Module::emit(b, OpCompositeExtract, {tu, su, usamp, 0});
+  const uint32_t sf = m.id(); Module::emit(b, OpConvertUToF, {tf, sf, su});
+  // Matches write_back (D24S8 big-endian [d_hi, d_mid, d_lo, stencil]) read as A8R8G8B8 (R=d_mid, G=d_lo, B=stencil, A=d_hi).
   const uint32_t res = m.id();
   Module::emit(b, OpCompositeConstruct,
-               {tv4, res, op2(OpFMul, tf, d_mid, inv255), op2(OpFMul, tf, d_lo, inv255), m.c_float(0.0f),
+               {tv4, res, op2(OpFMul, tf, d_mid, inv255), op2(OpFMul, tf, d_lo, inv255), op2(OpFMul, tf, sf, inv255),
                 op2(OpFMul, tf, d_hi, inv255)});
   Module::emit(b, OpStore, {out_var, res});
   Module::emit(b, OpReturn, {});
@@ -1200,12 +1348,11 @@ std::vector<uint32_t> spirv_convert_abgr_to_y16x16_fs() {
   const uint32_t uv2 = m.id(); Module::emit(b, OpVectorShuffle, {tv2, uv2, uv4, uv4, 0, 1});
   const uint32_t img = m.id(); Module::emit(b, OpLoad, {m.t_sampled_image(), img, tex});
   const uint32_t c = m.id(); Module::emit(b, OpImageSampleImplicitLod, {tv4, c, img, uv2});
-  // A8B8G8R8 stores R,G,B,A in memory bytes [0,1,2,3] -> big-endian 16-bit pairs:
-  //   Y16 (bytes 0..1, upper 16 bits) = (R*256 + G) / 65535 -> Green (channel 1)
-  //   X16 (bytes 2..3, lower 16 bits) = (B*256 + A) / 65535 -> Red   (channel 0)
+  // write_back (!argb): guest bytes [a, b, g, r].
+  // RSX Y16_X16 (0x95): R (X16) = lower 16 bits (g*256+r)/65535, G (Y16) = upper 16 bits (a*256+b)/65535.
   const uint32_t hi_w = m.c_float(65280.0f / 65535.0f), lo_w = m.c_float(255.0f / 65535.0f);
-  const uint32_t y16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 0), hi_w), op2(OpFMul, tf, ext(c, 1), lo_w));
-  const uint32_t x16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 2), hi_w), op2(OpFMul, tf, ext(c, 3), lo_w));
+  const uint32_t y16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 3), hi_w), op2(OpFMul, tf, ext(c, 2), lo_w));
+  const uint32_t x16 = op2(OpFAdd, tf, op2(OpFMul, tf, ext(c, 1), hi_w), op2(OpFMul, tf, ext(c, 0), lo_w));
   const uint32_t res = m.id();
   Module::emit(b, OpCompositeConstruct, {tv4, res, x16, y16, m.c_float(0.0f), m.c_float(1.0f)});
   Module::emit(b, OpStore, {out_var, res});

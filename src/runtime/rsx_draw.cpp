@@ -35,7 +35,7 @@ uint32_t texel_bytes(uint32_t f) {
   }
 }
 
-float half_to_float(uint16_t h) {
+float half_to_float_slow(uint16_t h) {
   const uint32_t sign = uint32_t(h >> 15) << 31, exp = (h >> 10) & 0x1F, mant = h & 0x3FF;
   uint32_t bits;
   if (exp == 0) {
@@ -52,6 +52,15 @@ float half_to_float(uint16_t h) {
   return std::bit_cast<float>(bits);
 }
 
+inline float half_to_float(uint16_t h) {
+  static const std::array<float, 65536> kLut = [] {
+    std::array<float, 65536> t{};
+    for (uint32_t i = 0; i < 65536; ++i) t[i] = half_to_float_slow(uint16_t(i));
+    return t;
+  }();
+  return kLut[h];
+}
+
 // ---- vertex fetch -----------------------------------------------------------------------
 enum VertexType { VT_S1 = 1, VT_F = 2, VT_SF = 3, VT_UB = 4, VT_S32K = 5, VT_CMP = 6, VT_UB256 = 7 };
 
@@ -60,29 +69,60 @@ struct Attrib {
   uint32_t type = 0, size = 0, stride = 0;
 };
 
-vec4 fetch_attrib(const Attrib& a, uint32_t index) {
-  vec4 v{0, 0, 0, 1};
-  if (!a.base || !a.size) return v;
+// Precomputed 256-entry uint8 -> [0,1] LUT.
+inline float u8_norm_to_float(uint8_t b) {
+  static const std::array<float, 256> kLut = [] {
+    std::array<float, 256> t{};
+    for (uint32_t i = 0; i < 256; ++i) t[i] = float(i) * (1.0f / 255.0f);
+    return t;
+  }();
+  return kLut[b];
+}
+
+inline void fetch_attrib_into(const Attrib& a, uint32_t index, float out[4]) {
+  out[0] = 0.0f; out[1] = 0.0f; out[2] = 0.0f; out[3] = 1.0f;
+  if (!a.base || !a.size) return;
   const uint8_t* p = a.base + size_t(index) * a.stride;
+  const uint32_t n = a.size < 4 ? a.size : 4;
   switch (a.type) {
-    case VT_F: for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = fbits(be32(p + 4 * c)); break;
-    case VT_SF: for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = half_to_float(be16(p + 2 * c)); break;
-    case VT_S1:
-      for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = std::max(-1.0f, float(int16_t(be16(p + 2 * c))) / 32767.0f);
+    case VT_F:
+      for (uint32_t c = 0; c < n; ++c) out[c] = fbits(be32(p + 4 * c));
       break;
-    case VT_S32K: for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = float(int16_t(be16(p + 2 * c))); break;
-    case VT_UB: for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = p[c] / 255.0f; break;
-    case VT_UB256: for (uint32_t c = 0; c < a.size && c < 4; ++c) v[c] = float(p[c]); break;
+    case VT_SF:
+      for (uint32_t c = 0; c < n; ++c) out[c] = half_to_float(be16(p + 2 * c));
+      break;
+    case VT_S1: {
+      constexpr float kInv32767 = 1.0f / 32767.0f;
+      for (uint32_t c = 0; c < n; ++c) {
+        const float f = float(int16_t(be16(p + 2 * c))) * kInv32767;
+        out[c] = f < -1.0f ? -1.0f : f;
+      }
+      break;
+    }
+    case VT_S32K:
+      for (uint32_t c = 0; c < n; ++c) out[c] = float(int16_t(be16(p + 2 * c)));
+      break;
+    case VT_UB:
+      for (uint32_t c = 0; c < n; ++c) out[c] = u8_norm_to_float(p[c]);
+      break;
+    case VT_UB256:
+      for (uint32_t c = 0; c < n; ++c) out[c] = float(p[c]);
+      break;
     case VT_CMP: {  // x:11 y:11 z:10, signed normalised
       const uint32_t w = be32(p);
-      auto sx = [](uint32_t bits, int n) { const int32_t s = int32_t(bits << (32 - n)) >> (32 - n); return float(s); };
-      v[0] = sx(w & 0x7FF, 11) / 1023.0f;
-      v[1] = sx((w >> 11) & 0x7FF, 11) / 1023.0f;
-      v[2] = sx(w >> 22, 10) / 511.0f;
+      auto sx = [](uint32_t bits, int nbits) { const int32_t s = int32_t(bits << (32 - nbits)) >> (32 - nbits); return float(s); };
+      out[0] = sx(w & 0x7FF, 11) * (1.0f / 1023.0f);
+      out[1] = sx((w >> 11) & 0x7FF, 11) * (1.0f / 1023.0f);
+      out[2] = sx(w >> 22, 10) * (1.0f / 511.0f);
       break;
     }
     default: break;
   }
+}
+
+inline vec4 fetch_attrib(const Attrib& a, uint32_t index) {
+  vec4 v;
+  fetch_attrib_into(a, index, v.data());
   return v;
 }
 
@@ -444,6 +484,14 @@ void reset_defaults(uint32_t* r) {
   r[m::ALPHA_FUNC] = 0x207;  // ALWAYS
   r[m::DEPTH_FUNC] = 0x201;  // LESS
   r[m::DEPTH_MASK] = 1;
+  r[m::STENCIL_MASK] = 0xFF;
+  r[m::STENCIL_FUNC] = 0x207;  // ALWAYS
+  r[m::STENCIL_FUNC_MASK] = 0xFF;
+  r[m::STENCIL_OP_FAIL] = r[m::STENCIL_OP_ZFAIL] = r[m::STENCIL_OP_ZPASS] = 0x1E00;  // KEEP
+  r[m::BACK_STENCIL_MASK] = 0xFF;
+  r[m::BACK_STENCIL_FUNC] = 0x207;
+  r[m::BACK_STENCIL_FUNC_MASK] = 0xFF;
+  r[m::BACK_STENCIL_OP_FAIL] = r[m::BACK_STENCIL_OP_ZPASS] = 0x1E00;
   r[m::BLEND_SFACTOR] = 0x00010001;  // ONE, ONE
   r[m::BLEND_DFACTOR] = 0;           // ZERO
   r[m::BLEND_EQUATION] = 0x80068006; // ADD
@@ -842,6 +890,32 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
   d.depth_test = r[m::DEPTH_TEST_ENABLE] && d.zbase && d.zpitch;
   d.depth_write = d.depth_test && r[m::DEPTH_MASK];
   d.depth_func = r[m::DEPTH_FUNC];
+  d.stencil_test = r[m::STENCIL_TEST_ENABLE] && d.zbase && d.zpitch;
+  d.two_sided_stencil = r[m::TWO_SIDED_STENCIL_TEST_ENABLE] != 0;
+  d.stencil_mask = uint8_t(r[m::STENCIL_MASK] & 0xFF);
+  d.stencil_func = r[m::STENCIL_FUNC];
+  d.stencil_ref = uint8_t(r[m::STENCIL_FUNC_REF] & 0xFF);
+  d.stencil_func_mask = uint8_t(r[m::STENCIL_FUNC_MASK] & 0xFF);
+  d.stencil_op_fail = r[m::STENCIL_OP_FAIL];
+  d.stencil_op_zfail = r[m::STENCIL_OP_ZFAIL];
+  d.stencil_op_zpass = r[m::STENCIL_OP_ZPASS];
+  if (d.two_sided_stencil) {
+    d.back_stencil_mask = uint8_t(r[m::BACK_STENCIL_MASK] & 0xFF);
+    d.back_stencil_func = r[m::BACK_STENCIL_FUNC];
+    d.back_stencil_ref = uint8_t(r[m::BACK_STENCIL_FUNC_REF] & 0xFF);
+    d.back_stencil_func_mask = uint8_t(r[m::BACK_STENCIL_FUNC_MASK] & 0xFF);
+    d.back_stencil_op_fail = r[m::BACK_STENCIL_OP_FAIL];
+    d.back_stencil_op_zfail = r[m::BACK_STENCIL_OP_ZFAIL];
+    d.back_stencil_op_zpass = r[m::BACK_STENCIL_OP_ZPASS];
+  } else {
+    d.back_stencil_mask = d.stencil_mask;
+    d.back_stencil_func = d.stencil_func;
+    d.back_stencil_ref = d.stencil_ref;
+    d.back_stencil_func_mask = d.stencil_func_mask;
+    d.back_stencil_op_fail = d.stencil_op_fail;
+    d.back_stencil_op_zfail = d.stencil_op_zfail;
+    d.back_stencil_op_zpass = d.stencil_op_zpass;
+  }
   d.blend = r[m::BLEND_ENABLE] != 0;
   d.sf_rgb = r[m::BLEND_SFACTOR] & 0xFFFF;
   d.sf_a = r[m::BLEND_SFACTOR] >> 16;
@@ -887,43 +961,157 @@ bool pack_indexed_geometry(const DrawEnv& env, const DrawCall& call, uint32_t in
   if (need_idx == 0) return true;
   if (need_idx > max_idx) return fail("index ring overflow");
 
-  // Resolve only the attributes actually read by the vertex program.
+  // Resolve only the attributes actually read by the vertex program into a compact array.
   const uint32_t base_off = r[m::VERTEX_DATA_BASE_OFFSET];
   const uint32_t base_idx = r[m::VERTEX_DATA_BASE_INDEX];
-  Attrib attribs[16];
-  uint8_t active[16];
+  struct PackedAttr {
+    Attrib a;
+    float cval[4];
+    uint8_t fast_kind = 0;  // 0=const, 1=F3, 2=F4, 3=SF2, 4=SF3, 5=SF4, 6=S1_2, 7=S1_3, 8=UB4, 9=CMP, 10=generic
+  };
+  PackedAttr act[16];
   uint32_t n_act = 0;
   for (uint32_t i = 0; i < 16; ++i) {
     if (!(in_mask & (1u << i))) continue;
-    active[n_act++] = uint8_t(i);
+    PackedAttr& pa = act[n_act++];
     const uint32_t f = r[m::VERTEX_ARRAY_FORMAT + i], off = r[m::VERTEX_ARRAY_OFFSET + i];
-    attribs[i].type = f & 0xF;
-    attribs[i].size = (f >> 4) & 0xF;
-    attribs[i].stride = (f >> 8) & 0xFF;
-    if (attribs[i].size) {
+    pa.a.type = f & 0xF;
+    pa.a.size = (f >> 4) & 0xF;
+    pa.a.stride = (f >> 8) & 0xFF;
+    pa.a.base = nullptr;
+    if (pa.a.size) {
       const uint32_t a = env.to_address((off & 0x7FFFFFFF) + base_off, off >> 31);
-      attribs[i].base = a ? env.mem + a : nullptr;
+      pa.a.base = a ? env.mem + a : nullptr;
+      if (!pa.a.base) {
+        pa.cval[0] = 0.0f; pa.cval[1] = 0.0f; pa.cval[2] = 0.0f; pa.cval[3] = 1.0f;
+        pa.fast_kind = 0;
+      } else if (pa.a.type == VT_F && pa.a.size == 3) pa.fast_kind = 1;
+      else if (pa.a.type == VT_F && pa.a.size >= 4) pa.fast_kind = 2;
+      else if (pa.a.type == VT_SF && pa.a.size == 2) pa.fast_kind = 3;
+      else if (pa.a.type == VT_SF && pa.a.size == 3) pa.fast_kind = 4;
+      else if (pa.a.type == VT_SF && pa.a.size >= 4) pa.fast_kind = 5;
+      else if (pa.a.type == VT_S1 && pa.a.size == 2) pa.fast_kind = 6;
+      else if (pa.a.type == VT_S1 && pa.a.size == 3) pa.fast_kind = 7;
+      else if (pa.a.type == VT_UB && pa.a.size >= 4) pa.fast_kind = 8;
+      else if (pa.a.type == VT_CMP) pa.fast_kind = 9;
+      else pa.fast_kind = 10;
+    } else if (env.const_attribs) {
+      pa.cval[0] = env.const_attribs[i][0]; pa.cval[1] = env.const_attribs[i][1];
+      pa.cval[2] = env.const_attribs[i][2]; pa.cval[3] = env.const_attribs[i][3];
+      pa.fast_kind = 0;
+    } else {
+      pa.cval[0] = 0.0f; pa.cval[1] = 0.0f; pa.cval[2] = 0.0f; pa.cval[3] = 1.0f;
+      pa.fast_kind = 0;
     }
   }
   const uint32_t vtx_floats = in_count * 4;
 
-  // Compact L1-friendly remap table: guest vertex id -> packed local vertex index.
+  auto emit_vtx = [&](uint32_t id, uint32_t loc) {
+    if (loc < max_vtx && vtx_floats) {
+      // Assemble in stack buffer then memcpy once to write-combined GPU vertex ring.
+      float vbuf[64];
+      float* dst = vbuf;
+      constexpr float kInv32767 = 1.0f / 32767.0f;
+      for (uint32_t ai = 0; ai < n_act; ++ai) {
+        const PackedAttr& pa = act[ai];
+        const uint8_t* p = pa.a.base + size_t(id) * pa.a.stride;
+        switch (pa.fast_kind) {
+          case 0:
+            dst[0] = pa.cval[0]; dst[1] = pa.cval[1]; dst[2] = pa.cval[2]; dst[3] = pa.cval[3];
+            break;
+          case 1:  // VT_F x3
+            dst[0] = fbits(be32(p)); dst[1] = fbits(be32(p + 4)); dst[2] = fbits(be32(p + 8)); dst[3] = 1.0f;
+            break;
+          case 2:  // VT_F x4
+            dst[0] = fbits(be32(p)); dst[1] = fbits(be32(p + 4)); dst[2] = fbits(be32(p + 8)); dst[3] = fbits(be32(p + 12));
+            break;
+          case 3:  // VT_SF x2
+            dst[0] = half_to_float(be16(p)); dst[1] = half_to_float(be16(p + 2)); dst[2] = 0.0f; dst[3] = 1.0f;
+            break;
+          case 4:  // VT_SF x3
+            dst[0] = half_to_float(be16(p)); dst[1] = half_to_float(be16(p + 2)); dst[2] = half_to_float(be16(p + 4)); dst[3] = 1.0f;
+            break;
+          case 5:  // VT_SF x4
+            dst[0] = half_to_float(be16(p)); dst[1] = half_to_float(be16(p + 2)); dst[2] = half_to_float(be16(p + 4)); dst[3] = half_to_float(be16(p + 6));
+            break;
+          case 6: {  // VT_S1 x2
+            const float f0 = float(int16_t(be16(p))) * kInv32767;
+            const float f1 = float(int16_t(be16(p + 2))) * kInv32767;
+            dst[0] = f0 < -1.0f ? -1.0f : f0; dst[1] = f1 < -1.0f ? -1.0f : f1; dst[2] = 0.0f; dst[3] = 1.0f;
+            break;
+          }
+          case 7: {  // VT_S1 x3
+            const float f0 = float(int16_t(be16(p))) * kInv32767;
+            const float f1 = float(int16_t(be16(p + 2))) * kInv32767;
+            const float f2 = float(int16_t(be16(p + 4))) * kInv32767;
+            dst[0] = f0 < -1.0f ? -1.0f : f0; dst[1] = f1 < -1.0f ? -1.0f : f1; dst[2] = f2 < -1.0f ? -1.0f : f2; dst[3] = 1.0f;
+            break;
+          }
+          case 8:  // VT_UB x4
+            dst[0] = u8_norm_to_float(p[0]); dst[1] = u8_norm_to_float(p[1]); dst[2] = u8_norm_to_float(p[2]); dst[3] = u8_norm_to_float(p[3]);
+            break;
+          case 9: {  // VT_CMP
+            const uint32_t w = be32(p);
+            dst[0] = float(int32_t(w << 21) >> 21) * (1.0f / 1023.0f);
+            dst[1] = float(int32_t((w >> 11) << 21) >> 21) * (1.0f / 1023.0f);
+            dst[2] = float(int32_t((w >> 22) << 22) >> 22) * (1.0f / 511.0f);
+            dst[3] = 1.0f;
+            break;
+          }
+          default:
+            fetch_attrib_into(pa.a, id, dst);
+            break;
+        }
+        dst += 4;
+      }
+      std::memcpy(dst_vtx + size_t(loc) * vtx_floats, vbuf, size_t(vtx_floats) * 4);
+    }
+  };
+
+  // Direct O(1) 64K lookup table for u16 indexed draws (99% of PS3 meshes): zero hashing/probing.
+  thread_local std::vector<uint32_t> d_stamp;
+  thread_local std::vector<uint32_t> d_local;
+  thread_local uint32_t dstamp = 0;
+
+  // Compact hash remap table fallback for u32 indexed / non-indexed draws.
   struct IdSlot { uint32_t stamp = 0, key = 0, local = 0; };
   thread_local std::vector<IdSlot> rtab;
   thread_local uint32_t rstamp = 0;
   thread_local std::vector<uint32_t> local_ids;
-  const size_t want_cap = std::bit_ceil(std::max<size_t>(256, n_raw * 2 + 16));
-  if (rtab.size() < want_cap) {
-    rtab.assign(want_cap, IdSlot{});
-    rstamp = 0;
+
+  const bool is_u16_indexed = call.indexed && (((r[m::INDEX_ARRAY_DMA] >> 4) & 0xF) == 1);
+  if (is_u16_indexed) {
+    if (d_stamp.empty()) {
+      d_stamp.assign(65536, 0);
+      d_local.assign(65536, 0);
+    }
+    if (++dstamp == 0) {
+      std::memset(d_stamp.data(), 0, 65536 * sizeof(uint32_t));
+      dstamp = 1;
+    }
+  } else {
+    const size_t want_cap = std::bit_ceil(std::max<size_t>(256, n_raw * 2 + 16));
+    if (rtab.size() < want_cap) {
+      rtab.assign(want_cap, IdSlot{});
+      rstamp = 0;
+    }
+    if (++rstamp == 0) {
+      for (auto& sl : rtab) sl.stamp = 0;
+      rstamp = 1;
+    }
   }
-  if (++rstamp == 0) {
-    for (auto& sl : rtab) sl.stamp = 0;
-    rstamp = 1;
-  }
-  const size_t rmask = rtab.size() - 1;
+  const size_t rmask = rtab.empty() ? 0 : (rtab.size() - 1);
   local_ids.clear();
   local_ids.reserve(n_raw);
+
+  auto intern_u16 = [&](uint16_t raw_idx) -> uint32_t {
+    if (d_stamp[raw_idx] == dstamp) return d_local[raw_idx];
+    const uint32_t loc = out_vtx++;
+    d_stamp[raw_idx] = dstamp;
+    d_local[raw_idx] = loc;
+    emit_vtx(uint32_t(raw_idx) + base_idx, loc);
+    return loc;
+  };
 
   auto intern = [&](uint32_t id) -> uint32_t {
     size_t slot = (size_t(id) * 2654435761u) & rmask;
@@ -932,16 +1120,7 @@ bool pack_indexed_geometry(const DrawEnv& env, const DrawCall& call, uint32_t in
       slot = (slot + 1) & rmask;
     }
     const uint32_t loc = out_vtx++;
-    if (loc < max_vtx && vtx_floats) {
-      float* dst = dst_vtx + size_t(loc) * vtx_floats;
-      for (uint32_t ai = 0; ai < n_act; ++ai) {
-        const uint32_t attr_i = active[ai];
-        const vec4 v = attribs[attr_i].size ? fetch_attrib(attribs[attr_i], id)
-                                            : (env.const_attribs ? env.const_attribs[attr_i] : vec4{0, 0, 0, 1});
-        dst[0] = v[0]; dst[1] = v[1]; dst[2] = v[2]; dst[3] = v[3];
-        dst += 4;
-      }
-    }
+    emit_vtx(id, loc);
     rtab[slot] = {rstamp, id, loc};
     return loc;
   };
@@ -955,12 +1134,20 @@ bool pack_indexed_geometry(const DrawEnv& env, const DrawCall& call, uint32_t in
       const uint32_t dma = r[m::INDEX_ARRAY_DMA];
       const uint32_t ib = env.to_address(r[m::INDEX_ARRAY_ADDRESS], dma & 0xF);
       if (!ib) return fail("no index buffer");
-      const bool u16 = ((dma >> 4) & 0xF) == 1;
       const uint8_t* ibp = env.mem + ib;
-      for (const auto& [first, count] : call.ranges) {
-        for (uint32_t k = 0; k < count && written < limit; ++k, ++written) {
-          const uint8_t* p = ibp + size_t(first + k) * (u16 ? 2 : 4);
-          *o++ = intern((u16 ? be16(p) : be32(p)) + base_idx);
+      if (is_u16_indexed) {
+        for (const auto& [first, count] : call.ranges) {
+          const uint8_t* p = ibp + size_t(first) * 2;
+          const uint32_t n = uint32_t(std::min<size_t>(count, limit - written));
+          for (uint32_t k = 0; k < n; ++k, p += 2) *o++ = intern_u16(be16(p));
+          written += n;
+        }
+      } else {
+        for (const auto& [first, count] : call.ranges) {
+          const uint8_t* p = ibp + size_t(first) * 4;
+          const uint32_t n = uint32_t(std::min<size_t>(count, limit - written));
+          for (uint32_t k = 0; k < n; ++k, p += 4) *o++ = intern(be32(p) + base_idx);
+          written += n;
         }
       }
     } else {
@@ -976,12 +1163,16 @@ bool pack_indexed_geometry(const DrawEnv& env, const DrawCall& call, uint32_t in
     const uint32_t dma = r[m::INDEX_ARRAY_DMA];
     const uint32_t ib = env.to_address(r[m::INDEX_ARRAY_ADDRESS], dma & 0xF);
     if (!ib) return fail("no index buffer");
-    const bool u16 = ((dma >> 4) & 0xF) == 1;
     const uint8_t* ibp = env.mem + ib;
-    for (const auto& [first, count] : call.ranges) {
-      for (uint32_t k = 0; k < count; ++k) {
-        const uint8_t* p = ibp + size_t(first + k) * (u16 ? 2 : 4);
-        local_ids.push_back(intern((u16 ? be16(p) : be32(p)) + base_idx));
+    if (is_u16_indexed) {
+      for (const auto& [first, count] : call.ranges) {
+        const uint8_t* p = ibp + size_t(first) * 2;
+        for (uint32_t k = 0; k < count; ++k, p += 2) local_ids.push_back(intern_u16(be16(p)));
+      }
+    } else {
+      for (const auto& [first, count] : call.ranges) {
+        const uint8_t* p = ibp + size_t(first) * 4;
+        for (uint32_t k = 0; k < count; ++k, p += 4) local_ids.push_back(intern(be32(p) + base_idx));
       }
     }
   } else {

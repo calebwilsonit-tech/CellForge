@@ -375,6 +375,23 @@ void Rsx::flip(uint32_t id, bool immediate) {
   }
   ++stats.flips;
   flip_status = 0;
+  if (static const bool fps_log = std::getenv("PS3RECOMP_FPS_LOG") != nullptr; fps_log) {
+    static auto fps_t0 = Clock::now();
+    static uint64_t fps_flips0 = 0, fps_draws0 = 0;
+    const auto now = Clock::now();
+    const double dt = std::chrono::duration<double>(now - fps_t0).count();
+    if (dt >= 2.0) {
+      const uint64_t fl = stats.flips.load();
+      const uint64_t dr = stats.draws.load();
+      const uint64_t df = fl - fps_flips0;
+      const uint64_t dd = dr - fps_draws0;
+      K().logf("rsx fps: flip=%llu fps=%.1f draws/f=%.1f",
+               (unsigned long long)fl, df / dt, df ? double(dd) / df : 0.0);
+      fps_t0 = now;
+      fps_flips0 = fl;
+      fps_draws0 = dr;
+    }
+  }
   call_handler(flip_handler, 1);
 }
 
@@ -731,8 +748,7 @@ void Rsx::end_draw() {
   static const bool trace = std::getenv("PS3RECOMP_RSX_TRACE") != nullptr;
   static const bool trace_flip_env = std::getenv("PS3RECOMP_TRACE_FLIP") != nullptr;
   static const bool cpu_vp = std::getenv("PS3RECOMP_CPU_VP") != nullptr;
-  if (!cpu_vp && !trace_flip_env && !(trace && stats.draws.load() <= 3) &&
-      !regs_[M_ZPASS_PIXEL_COUNT_ENABLE / 4]) {
+  if (!cpu_vp && !trace_flip_env && !(trace && stats.draws.load() <= 3)) {
     if (GpuRenderer* g = gpu()) {
       if (!prepare_draw_state(env, d, &err)) {
         ++stats.skipped_draws;
@@ -742,8 +758,14 @@ void Rsx::end_draw() {
       uint32_t drawn_tris = 0;
       if (g->draw_raw(env, pending_, d, drawn_tris, &err)) {
         stats.triangles += drawn_tris;
+        if (regs_[M_ZPASS_PIXEL_COUNT_ENABLE / 4]) {
+          zpass_pixels_ += std::max<uint32_t>(64u, drawn_tris * 64u);
+        }
         ++gpu_draws;
         return;
+      }
+      if (static const bool fps_log = std::getenv("PS3RECOMP_FPS_LOG") != nullptr; fps_log) {
+        report("draw_raw fallback (prim=" + std::to_string(pending_.primitive) + "): " + (err.empty() ? "vp/pipe failed" : err));
       }
     }
   }

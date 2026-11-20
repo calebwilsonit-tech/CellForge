@@ -3,6 +3,7 @@
 // Active on Windows x64; other platforms fall back to the interpreter.
 
 #include <cstdint>
+#include <unordered_map>
 
 namespace spu {
 
@@ -41,8 +42,22 @@ class SpuJit {
 
   // Direct-mapped table indexed by (pc >> 2), 65536 entries (512 KB).
   BlockFn* blocks_ = nullptr;
-  // Bit p (0..63) is set if any block was compiled from 4KB LS page p.
+  // Bit p (0..63) is set if any active block in blocks_ was compiled from 4KB LS page p.
   uint64_t code_pages_ = 0;
+
+  // Content-addressed cache of compiled blocks: survives SPURS job DMA swaps so
+  // previously compiled SPU jobs are re-bound in O(1) without x86-64 re-emission.
+  struct BlockKey {
+    uint32_t pc, count;
+    uint64_t h1, h2;
+    bool operator==(const BlockKey& o) const { return pc == o.pc && count == o.count && h1 == o.h1 && h2 == o.h2; }
+  };
+  struct BlockKeyHash {
+    size_t operator()(const BlockKey& k) const noexcept {
+      return size_t(k.h1 ^ (k.h2 * 0x9E3779B97F4A7C15ull) ^ (uint64_t(k.pc) << 32) ^ k.count);
+    }
+  };
+  std::unordered_map<BlockKey, BlockFn, BlockKeyHash> block_cache_;
 };
 
 }  // namespace spu

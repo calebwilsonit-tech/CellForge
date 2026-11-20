@@ -22,7 +22,14 @@ constexpr uint32_t SURFACE_CLIP_H = 0x80, SURFACE_CLIP_V = 0x81, SURFACE_FORMAT 
                    SURFACE_PITCH_Z = 0x8B;
 constexpr uint32_t ALPHA_TEST_ENABLE = 0xC1, ALPHA_FUNC = 0xC2, ALPHA_REF = 0xC3;
 constexpr uint32_t BLEND_ENABLE = 0xC4, BLEND_SFACTOR = 0xC5, BLEND_DFACTOR = 0xC6, BLEND_COLOR = 0xC7,
-                   BLEND_EQUATION = 0xC8, COLOR_MASK = 0xC9, POLY_OFFSET_FILL_ENABLE = 0xD8, BLEND_COLOR2 = 0xDF;
+                   BLEND_EQUATION = 0xC8, COLOR_MASK = 0xC9,
+                   STENCIL_TEST_ENABLE = 0xCA, STENCIL_MASK = 0xCB, STENCIL_FUNC = 0xCC,
+                   STENCIL_FUNC_REF = 0xCD, STENCIL_FUNC_MASK = 0xCE, STENCIL_OP_FAIL = 0xCF,
+                   STENCIL_OP_ZFAIL = 0xD0, STENCIL_OP_ZPASS = 0xD1, TWO_SIDED_STENCIL_TEST_ENABLE = 0xD2,
+                   BACK_STENCIL_MASK = 0xD3, BACK_STENCIL_FUNC = 0xD4, BACK_STENCIL_FUNC_REF = 0xD5,
+                   BACK_STENCIL_FUNC_MASK = 0xD6, BACK_STENCIL_OP_FAIL = 0xD7,
+                   POLY_OFFSET_FILL_ENABLE = 0xD8, BACK_STENCIL_OP_ZFAIL = 0xD8, BACK_STENCIL_OP_ZPASS = 0xD9,
+                   BLEND_COLOR2 = 0xDF;
 constexpr uint32_t SCISSOR_H = 0x230, SCISSOR_V = 0x231, SHADER_PROGRAM = 0x239;
 constexpr uint32_t VIEWPORT_H = 0x280, VIEWPORT_V = 0x281, VIEWPORT_OFFSET = 0x288, VIEWPORT_SCALE = 0x28C;
 constexpr uint32_t POLYGON_OFFSET_SCALE_FACTOR = 0x298, POLYGON_OFFSET_BIAS = 0x299;
@@ -106,6 +113,11 @@ struct PreparedDraw {
   uint32_t surface_w = 0, surface_h = 0;
   bool depth_test = false, depth_write = false;
   uint32_t depth_func = 0x201;
+  bool stencil_test = false, two_sided_stencil = false;
+  uint8_t stencil_mask = 0xFF, stencil_ref = 0, stencil_func_mask = 0xFF;
+  uint32_t stencil_func = 0x207, stencil_op_fail = 0x1E00, stencil_op_zfail = 0x1E00, stencil_op_zpass = 0x1E00;
+  uint8_t back_stencil_mask = 0xFF, back_stencil_ref = 0, back_stencil_func_mask = 0xFF;
+  uint32_t back_stencil_func = 0x207, back_stencil_op_fail = 0x1E00, back_stencil_op_zfail = 0x1E00, back_stencil_op_zpass = 0x1E00;
   bool blend = false;
   uint32_t sf_rgb = 1, sf_a = 1, df_rgb = 0, df_a = 0, eq_rgb = 0x8006, eq_a = 0x8006;
   uint32_t color_mask = 0x01010101;

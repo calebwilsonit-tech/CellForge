@@ -47,7 +47,7 @@ using detail::Op;
 using detail::QuadShuffleTables;
 using detail::sext;
 
-constexpr size_t kCodeBufSize = 8 * 1024 * 1024;  // 8 MB executable buffer
+constexpr size_t kCodeBufSize = 16 * 1024 * 1024;  // 16 MB executable buffer
 constexpr size_t kBlockCount = kLsSize / 4;       // 65536
 constexpr int kMaxBlockInsns = 64;
 constexpr int kSliceBudget = 1024;
@@ -442,10 +442,11 @@ void SpuJit::build_trampoline() {
 }
 
 void SpuJit::invalidate_all() {
-  if (!code_ || !code_pages_) return;
-  std::memset(blocks_, 0, kBlockCount * sizeof(BlockFn));
+  if (!code_) return;
+  if (code_pages_) std::memset(blocks_, 0, kBlockCount * sizeof(BlockFn));
   code_pos_ = code_reset_pos_;
   code_pages_ = 0;
+  block_cache_.clear();
 }
 
 void SpuJit::invalidate_ls(uint32_t addr, uint32_t len) {
@@ -455,7 +456,12 @@ void SpuJit::invalidate_ls(uint32_t addr, uint32_t len) {
   const uint32_t p1 = end >> 12;
   const uint32_t count = p1 - p0 + 1;
   const uint64_t mask = (count >= 64) ? ~0ull : (((1ull << count) - 1ull) << p0);
-  if (code_pages_ & mask) invalidate_all();
+  if (!(code_pages_ & mask)) return;
+  // Blocks never cross 4KB page boundaries and all inter-block jumps dispatch
+  // dynamically through blocks_[], so clearing only the overwritten pages preserves
+  // untouched code (e.g. SPURS kernel) and keeps compiled job blocks in block_cache_.
+  std::memset(blocks_ + (p0 << 10), 0, size_t(count) * 1024 * sizeof(BlockFn));
+  code_pages_ &= ~mask;
 }
 
 uint32_t SpuJit::run(SpuCore& core) {
@@ -480,7 +486,50 @@ uint32_t SpuJit::run(SpuCore& core) {
   }
 }
 
+static bool is_block_terminator(Op op) {
+  switch (op) {
+    case Op::Br: case Op::Bra: case Op::Brsl: case Op::Brasl:
+    case Op::Brz: case Op::Brnz: case Op::Brhz: case Op::Brhnz:
+    case Op::Bi: case Op::Bisl: case Op::Biz: case Op::Binz:
+    case Op::Bihz: case Op::Bihnz:
+    case Op::Stop: case Op::Wrch: case Op::Rdch: case Op::Rchcnt:
+    case Op::Iret: case Op::Heq: case Op::Hgt: case Op::Hlgt:
+    case Op::Heqi: case Op::Hgti: case Op::Hlgti: case Op::Invalid:
+      return true;
+    default:
+      return false;
+  }
+}
+
 SpuJit::BlockFn SpuJit::compile_block(SpuCore& core, uint32_t start_pc) {
+  const uint8_t* const ls = core.ls();
+  const uint32_t spc = start_pc & kLsMask & ~3u;
+  const uint32_t start_page = spc >> 12;
+
+  // Compute content-addressed key over the raw SPU instructions of this block
+  // (capped at the 4KB page boundary so per-page invalidation is exact).
+  uint64_t h1 = 0xCBF29CE484222325ull ^ spc;
+  uint64_t h2 = 0x9E3779B97F4A7C15ull ^ (uint64_t(spc) << 17);
+  uint32_t scan_pc = spc;
+  uint32_t scan_count = 0;
+  for (int c = 0; c < kMaxBlockInsns && (scan_pc >> 12) == start_page; ++c) {
+    uint32_t raw_be;
+    std::memcpy(&raw_be, ls + scan_pc, 4);
+    const uint32_t raw = bswap_u32(raw_be);
+    h1 = (h1 ^ raw) * 0x100000001B3ull;
+    h2 = (h2 ^ (uint64_t(raw) * 0xBF58476D1CE4E5B9ull));
+    h2 = (h2 << 27) | (h2 >> 37);
+    ++scan_count;
+    scan_pc = (scan_pc + 4) & kLsMask;
+    if (is_block_terminator(detail::g_table.op[raw >> 21])) break;
+  }
+  const BlockKey key{spc, scan_count, h1, h2};
+  if (auto it = block_cache_.find(key); it != block_cache_.end()) {
+    code_pages_ |= (1ull << start_page);
+    blocks_[spc >> 2] = it->second;
+    return it->second;
+  }
+
   // Leave generous headroom so a single block never overflows mid-emit.
   if (code_pos_ + 16384 > code_cap_) invalidate_all();
   while (code_pos_ & 15) code_[code_pos_++] = 0x90;
@@ -488,12 +537,11 @@ SpuJit::BlockFn SpuJit::compile_block(SpuCore& core, uint32_t start_pc) {
   uint8_t* const block_start = code_ + code_pos_;
   Emit e{code_, code_pos_, code_cap_};
 
-  const uint8_t* const ls = core.ls();
-  uint32_t cur_pc = start_pc & kLsMask & ~3u;
+  uint32_t cur_pc = spc;
   bool ended = false;
+  code_pages_ |= (1ull << start_page);
 
-  for (int count = 0; count < kMaxBlockInsns && !ended; ++count) {
-    code_pages_ |= (1ull << (cur_pc >> 12));
+  for (int count = 0; count < kMaxBlockInsns && !ended && (cur_pc >> 12) == start_page; ++count) {
     uint32_t raw_be;
     std::memcpy(&raw_be, ls + cur_pc, 4);
     const uint32_t raw = bswap_u32(raw_be);
@@ -1496,7 +1544,8 @@ SpuJit::BlockFn SpuJit::compile_block(SpuCore& core, uint32_t start_pc) {
   }
 
   code_pos_ = e.pos;
-  blocks_[start_pc >> 2] = block_start;
+  blocks_[spc >> 2] = block_start;
+  block_cache_.emplace(key, block_start);
   return block_start;
 }
 
