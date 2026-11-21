@@ -30,6 +30,9 @@
 #include <filesystem>
 #include <fstream>
 #include "options.h"
+#include <ctime>
+
+#include "presenter.h"
 #include "profiler.h"
 #include "spirv_gen.h"
 
@@ -180,6 +183,7 @@ struct Surface {
   bool dirty = false, needs_upload = true;
   bool guarded = false;  // guest pages access-protected until the GPU data is written back
   uint64_t write_seq = 0;
+  uint64_t last_use = 0;       // frame_seq_ of the last draw/clear/sample that touched this surface
   uint32_t span() const { return pitch * image.h; }
 };
 
@@ -409,8 +413,54 @@ class VulkanRenderer final : public GpuRenderer {
   std::unordered_map<uint64_t, Texture> textures_;
   std::vector<uint64_t> dynamic_tex_keys_;
   std::unordered_map<uint64_t, VkImageView> frame_tex_cache_;
-  std::unordered_map<uint64_t, VkImageView> static_bc_cache_;
+  // Static DXT/BC textures by (address, shape, format). Entries remember a hash of the texture bytes and are re-verified
+  // against guest memory (every frame for small textures, every 30 frames for large ones): a streaming game reuses
+  // the same texture slots for different textures, and small ones (lighting ramps) are rewritten as you move around.
+  struct StaticBc { VkImageView view = VK_NULL_HANDLE; uint64_t hash = 0; uint64_t verified = 0; };
+  std::unordered_map<uint64_t, StaticBc> static_bc_cache_;
+  uint32_t static_bc_checks_ = 0, static_bc_stale_ = 0;
   uint64_t flush_seq_ = 1;
+  uint64_t frame_seq_ = 1;  // advances at every flip; drives surface LRU eviction
+  size_t surf_evictions_ = 0;
+  // Guest addresses of depth surfaces destroyed by an eviction: when one is recreated its
+  // contents (flushed to guest memory first) are uploaded instead of starting undefined.
+  std::set<std::pair<uint32_t, uint32_t>> evicted_depth_;  // (addr, pitch)
+  void evict_surfaces(uint8_t* mem);
+
+  // ---- diagnostics: PS3RECOMP_FPS_LOG periodic stats, and the F4 capture (render targets + one frame's draws) ----
+  struct RtStat { uint32_t draws = 0; uint64_t tris = 0; uint32_t w = 0, h = 0; };
+  std::map<std::pair<uint32_t, uint32_t>, RtStat> rt_stats_;  // (colour addr or 0 for depth-only, depth addr)
+  uint32_t tex_path_[3][256] = {};  // [0]=GPU surface, [1]=GPU composite, [2]=guest-memory decode; by texture format
+  std::chrono::steady_clock::time_point last_flip_t_{};
+  double ft_sum_ = 0, ft_max_ = 0;
+  uint32_t ft_n_ = 0, ft_gt20_ = 0, ft_gt25_ = 0, ft_gt34_ = 0, diag_flips_ = 0, diag_draws_ = 0;
+  bool trace_frame_ = false;
+  std::vector<std::string> frame_trace_;
+  std::string cur_tex_trace_, capture_dir_;
+  // F7/F8/F9 draw stepper: renders only the first N "scene" draws (colour-writing draws into a >1.2 Mpixel target)
+  // of each frame so the draw that introduces an artefact can be found. F7 = off, F8 = fewer, F9 = more.
+  int dbg_draw_limit_ = -1, dbg_scene_idx_ = 0, dbg_last_scene_draws_ = 0, dbg_cur_idx_ = -1, seen_f7_ = 0, seen_f8_ = 0, seen_f9_ = 0;
+  uint32_t dbg_step_flips_ = 0;
+  std::string dbg_last_desc_, dbg_prev_desc_;
+  // F11 sweep: limit 0, 6, 12, ... with a scene image saved at each step.
+  bool scan_active_ = false;
+  int scan_limit_ = 0, seen_f11_ = 0;
+  std::string scan_dir_, scan_text_;
+  void scan_step(uint8_t* mem);
+  bool dbg_skip_draw(const PreparedDraw& d);
+  int dbg_lum_mode_ = [] { const char* e = std::getenv("PS3RECOMP_LUM_MODE"); return e ? std::atoi(e) % 5 : 0; }();
+  int seen_f12_ = 0;
+  int dbg_border_ = 0;          // F2: shadow sampler border 0=auto (as the game's border colour), 1=white, 2=black
+  bool dbg_clamp_off_ = false;  // F3: clip instead of clamp window z
+  int seen_f2_ = 0, seen_f3_ = 0, seen_f5_ = 0, seen_f6_ = 0;
+  bool dbg_cascade_lit_ = false;  // F5: depth-compare shadow samplers always pass (= lit)
+  int dbg_vsm_ = 0;               // F6: Y16_X16 atlas replaced by 0=real, 1=(0,0), 2=(1,1)
+  Image vsm_const_[2];
+  VkImageView vsm_const_view(int mode, const TexUnit& t);
+  void note_draw(const PreparedDraw& d, Surface* color, Surface* depth, bool dummy_color, uint32_t tris, const char* kind);
+  void note_tex(uint32_t unit, const TexUnit& t, int path);
+  void diag_flip(uint8_t* mem);
+  void capture_surfaces(uint8_t* mem);
   using SamplerKey = std::tuple<bool, bool, bool, bool, int, uint32_t, uint32_t, uint32_t, bool, uint32_t, uint32_t, int32_t>;
   std::map<SamplerKey, VkSampler> samplers_;
   std::vector<std::pair<Surface*, VkDeviceSize>> pending_readback_;
@@ -1019,8 +1069,10 @@ Surface* VulkanRenderer::surface(uint8_t* mem, uint32_t addr, uint32_t pitch, ui
                                  uint32_t depth_fmt, bool argb) {
   for (auto& s : surfaces_) {
     if (s->addr != addr || s->depth != depth) continue;
-    if (s->pitch == pitch && s->image.w >= w && s->image.h >= h && s->argb == argb && s->depth_fmt == depth_fmt)
+    if (s->pitch == pitch && s->image.w >= w && s->image.h >= h && s->argb == argb && s->depth_fmt == depth_fmt) {
+      s->last_use = frame_seq_;
       return s.get();
+    }
   }
   for (auto& s : surfaces_) {
     if (s->addr != addr || s->depth != depth || s->pitch != pitch || s->argb != argb || s->depth_fmt != depth_fmt) continue;
@@ -1028,19 +1080,28 @@ Surface* VulkanRenderer::surface(uint8_t* mem, uint32_t addr, uint32_t pitch, ui
     w = std::max(w, s->image.w);
     h = std::max(h, s->image.h);
     if (s->dirty) flush_for(mem, s->depth, kFlushResize, s->addr, uint64_t(s->addr) + s->span());
+    if (s->depth && s->addr) evicted_depth_.insert({s->addr, s->pitch});  // reload the flushed depth into the bigger surface
     destroy_surface(*s);
     s = std::move(surfaces_.back());
     surfaces_.pop_back();
     break;
   }
-  if (surfaces_.size() >= 64) {
-    flush_for(mem, false, kFlushSurfaceLimit);
-    for (auto& s : surfaces_) destroy_surface(*s);
-    surfaces_.clear();
-    surf_lo_ = ~0ull;
-    surf_hi_ = 0;
+  {
+    static const bool log_surf = std::getenv("PS3RECOMP_FPS_LOG") != nullptr;
+    static size_t high_water = 0;
+    if (log_surf && surfaces_.size() + 1 > high_water) {
+      high_water = surfaces_.size() + 1;
+      logf("[gpu] render-target surfaces: %zu (limit 64) new %ux%u pitch %u @%08X %s", high_water, w, h, pitch, addr,
+           depth ? "depth" : "color");
+    }
   }
+  static const size_t surf_limit = [] {  // PS3RECOMP_SURFACE_LIMIT: test hook to force evictions
+    const char* e = std::getenv("PS3RECOMP_SURFACE_LIMIT");
+    return e ? size_t(std::max(4, std::atoi(e))) : size_t(64);
+  }();
+  if (surfaces_.size() >= surf_limit) evict_surfaces(mem);
   auto s = std::make_unique<Surface>();
+  s->last_use = frame_seq_;
   s->addr = addr;
   s->pitch = pitch;
   s->depth = depth;
@@ -1070,13 +1131,63 @@ Surface* VulkanRenderer::surface(uint8_t* mem, uint32_t addr, uint32_t pitch, ui
       depth ? VkImageAspectFlags(VK_IMAGE_ASPECT_DEPTH_BIT | (has_stencil_ ? VK_IMAGE_ASPECT_STENCIL_BIT : 0))
             : VkImageAspectFlags(VK_IMAGE_ASPECT_COLOR_BIT);
   transition_general(s->image.img, init_asp);
+  // A depth surface starts undefined, except one recreated after an eviction: its data was flushed to guest
+  // memory and the game may rely on it (e.g. a cascade that isn't re-rendered every frame).
   s->needs_upload = !depth;
+  if (depth && s->addr && evicted_depth_.erase({s->addr, s->pitch})) s->needs_upload = true;
   if (s->addr) {
     surf_lo_ = std::min<uint64_t>(surf_lo_, s->addr);
     surf_hi_ = std::max<uint64_t>(surf_hi_, uint64_t(s->addr) + s->span());
   }
   surfaces_.push_back(std::move(s));
   return surfaces_.back().get();
+}
+
+// Called when 64 render-target surfaces exist and another is needed. Everything the GPU holds is written back
+// to guest memory first (depth included, so nothing is lost), then only surfaces that haven't been drawn to,
+// cleared or sampled for a few frames are destroyed. Surfaces in use stay valid, which also keeps the
+// Surface* a draw already fetched (e.g. its colour target while it asks for the depth target) alive.
+void VulkanRenderer::evict_surfaces(uint8_t* mem) {
+  constexpr uint64_t kKeepFrames = 4;
+  constexpr size_t kHardCap = 192;
+  flush_for(mem, true, kFlushSurfaceLimit);
+
+  std::vector<size_t> victims;
+  for (size_t i = 0; i < surfaces_.size(); ++i)
+    if (frame_seq_ - surfaces_[i]->last_use > kKeepFrames) victims.push_back(i);
+  if (victims.empty()) {
+    static bool warned = false;
+    if (!warned) { warned = true; logf("[gpu] %zu render-target surfaces all in recent use; allowing growth up to %zu", surfaces_.size(), kHardCap); }
+    if (surfaces_.size() < kHardCap) return;
+    // Hard cap: drop the least recently used quarter regardless.
+    std::vector<size_t> order(surfaces_.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return surfaces_[a]->last_use < surfaces_[b]->last_use; });
+    for (size_t k = 0; k < order.size() / 4; ++k)
+      if (surfaces_[order[k]]->last_use != frame_seq_) victims.push_back(order[k]);
+    if (victims.empty()) return;
+  }
+  std::vector<std::unique_ptr<Surface>> drop, keep;
+  std::vector<bool> is_victim(surfaces_.size(), false);
+  for (size_t i : victims) is_victim[i] = true;
+  for (size_t i = 0; i < surfaces_.size(); ++i) (is_victim[i] ? drop : keep).push_back(std::move(surfaces_[i]));
+  surfaces_ = std::move(keep);
+  for (auto& s : drop) {
+    if (s->depth && s->addr) evicted_depth_.insert({s->addr, s->pitch});
+    destroy_surface(*s);
+  }
+  surf_lo_ = ~0ull;
+  surf_hi_ = 0;
+  for (auto& s : surfaces_)
+    if (s->addr) {
+      surf_lo_ = std::min<uint64_t>(surf_lo_, s->addr);
+      surf_hi_ = std::max<uint64_t>(surf_hi_, uint64_t(s->addr) + s->span());
+    }
+  ++surf_evictions_;
+  static const bool verbose = std::getenv("PS3RECOMP_FPS_LOG") != nullptr;
+  if (verbose || surf_evictions_ <= 3)
+    logf("[gpu] surface limit: evicted %zu unused render-target surfaces, kept %zu (eviction #%zu)", drop.size(),
+         surfaces_.size(), surf_evictions_);
 }
 
 bool VulkanRenderer::upload_surface(uint8_t* mem, Surface& s) {
@@ -1216,6 +1327,12 @@ uint64_t hash_bytes(const uint8_t* p, size_t n) {
 }
 }  // namespace
 
+namespace {
+// How many frames a cached static texture is trusted before its bytes are re-hashed: tiny ones (lighting ramps)
+// every frame, small ones every 3 frames, large ones every 30.
+inline uint64_t static_bc_period(uint32_t size) { return size <= 1024 ? 1 : size <= 16384 ? 3 : 30; }
+}  // namespace
+
 VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   // Key: location, shape, format and a hash of the bytes (catches CPU updates).
   const uint32_t size = t.byte_size();
@@ -1247,7 +1364,19 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   const bool is_static_bc = !dynamic_rt && (t.format == 0x86 || t.format == 0x87 || t.format == 0x88);
   if (is_static_bc) {
     auto sc = static_bc_cache_.find(cache_key);
-    if (sc != static_bc_cache_.end()) return sc->second;
+    if (sc != static_bc_cache_.end()) {
+      StaticBc& e = sc->second;
+      static const bool no_revalidate = std::getenv("PS3RECOMP_NO_TEX_REVALIDATE") != nullptr;
+      const uint64_t period = static_bc_period(size);
+      if (no_revalidate || frame_seq_ - e.verified < period) return e.view;
+      ++static_bc_checks_;
+      if ((hash_bytes(t.base, size) ^ desc_key) == e.hash) {
+        e.verified = frame_seq_;
+        return e.view;
+      }
+      ++static_bc_stale_;  // the game rewrote this texture slot: forget the old image and upload the new content
+      static_bc_cache_.erase(sc);
+    }
   } else if (!dynamic_rt) {
     auto fc = frame_tex_cache_.find(cache_key);
     if (fc != frame_tex_cache_.end()) return fc->second;
@@ -1258,7 +1387,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
   if (it != textures_.end()) {
     it->second.last_flush = flush_seq_;
     const VkImageView view = get_view(it->second.image, false, t.remap);
-    if (is_static_bc) static_bc_cache_[cache_key] = view;
+    if (is_static_bc) static_bc_cache_[cache_key] = StaticBc{view, h, frame_seq_ - (cache_key >> 9) % static_bc_period(size)};
     else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
     return view;
   }
@@ -1372,7 +1501,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = StaticBc{view, h, frame_seq_ - (cache_key >> 9) % static_bc_period(size)};
       else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
@@ -1458,7 +1587,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = StaticBc{view, h, frame_seq_ - (cache_key >> 9) % static_bc_period(size)};
       else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
@@ -1498,7 +1627,7 @@ VkImageView VulkanRenderer::texture(const TexUnit& t, std::string* error) {
       barrier_all();
       auto& stored = textures_[h] = std::move(tex);
       const VkImageView view = get_view(stored.image, false, t.remap);
-      if (is_static_bc) static_bc_cache_[cache_key] = view;
+      if (is_static_bc) static_bc_cache_[cache_key] = StaticBc{view, h, frame_seq_ - (cache_key >> 9) % static_bc_period(size)};
       else if (!dynamic_rt) frame_tex_cache_[cache_key] = view;
       return view;
     }
@@ -1582,6 +1711,7 @@ VkImageView VulkanRenderer::composite(const TexUnit& t, const std::vector<Surfac
   CompositeImage& ci = composites_[{t.address, t.width, t.height, t.pitch}];
   uint64_t sig = 0x9E3779B97F4A7C15ull;
   for (Surface* s : sources) {
+    s->last_use = frame_seq_;
     sig ^= (uint64_t(s->addr) << 1) ^ ((s->write_seq + 1) * 0xBF58476D1CE4E5B9ull) ^ (s->needs_upload ? 1ull : 0ull);
     sig = std::rotl(sig, 13) * 0x94D049BB133111EBull;
   }
@@ -1647,11 +1777,13 @@ VkImageView VulkanRenderer::composite(const TexUnit& t, const std::vector<Surfac
 VkSampler VulkanRenderer::sampler(const TexUnit& t) {
   const bool shadow = t.is_shadow();
   const uint32_t wrap_r = t.is_3d() ? t.wrap_r : 3u;
-  const uint32_t zfunc = shadow ? (t.zfunc & 7u) : 7u;
+  const uint32_t zfunc = shadow ? (dbg_cascade_lit_ ? 7u : (t.zfunc & 7u)) : 7u;
   uint32_t border_mode = 0;  // 0=transparent black, 1=opaque black, 2=opaque white
   if (shadow) {
     // Outside the shadow map frustum, depth 1.0 (white) avoids spurious shadows.
     border_mode = (t.border_color == 0u || (t.border_color & 0x00FFFFFFu) >= 0x00800000u) ? 2u : 1u;
+    if (dbg_border_ == 1) border_mode = 2u;       // F2 debug: force white
+    else if (dbg_border_ == 2) border_mode = 1u;  // F2 debug: force black
   } else if (t.border_color == 0xFFFFFFFFu) {
     border_mode = 2u;
   } else if (t.border_color == 0xFF000000u) {
@@ -1794,6 +1926,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   mix(vp && d.cull ? d.cull_face : 0u);
   mix(vp && d.cull ? (d.front_ccw ? 1u : 0u) : 0u);
   mix(d.poly_offset ? 1u : 0u);
+  mix(dbg_clamp_off_ ? 0xC1A3Full : 0u);
   auto it = pipelines_.find(key);
   if (it != pipelines_.end()) return it->second;
 
@@ -1859,7 +1992,7 @@ VkPipeline VulkanRenderer::pipeline(const PreparedDraw& d, bool with_depth, cons
   vps.viewportCount = 1;
   vps.scissorCount = 1;
   VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-  rs.depthClampEnable = depth_clamp_ ? VK_TRUE : VK_FALSE;  // the RSX clamps window z rather than clipping
+  rs.depthClampEnable = (depth_clamp_ && !dbg_clamp_off_) ? VK_TRUE : VK_FALSE;  // the RSX clamps window z rather than clipping
   rs.depthBiasEnable = d.poly_offset ? VK_TRUE : VK_FALSE;
   rs.polygonMode = VK_POLYGON_MODE_FILL;
   if (vp) {
@@ -2093,6 +2226,7 @@ VkImageView VulkanRenderer::resolve_gpu_tex(const TexUnit& t, Surface* active_co
   for (auto& s : surfaces_) {
     if (!s->addr || s->needs_upload || s->addr != t.address || s->image.w != t.width || s->image.h != t.height)
       continue;
+    s->last_use = frame_seq_;
     // 1. ARGB color surface sampled as A8R8G8B8 / D8R8G8B8.
     if (!s->depth && s->argb && (t.format == 0x85 || t.format == 0x9E)) {
       if (s.get() != active_color) return get_view(s->image, t.is_srgb(), t.remap);
@@ -2182,6 +2316,7 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
   InRenderer in_renderer;
   if (!g_guard_base.load()) g_guard_base = env.mem;
   if (d.tris.empty()) return true;
+  if (dbg_skip_draw(d)) return true;
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
 
   const bool use_depth = d.depth_test || d.depth_write || d.stencil_test;
@@ -2253,11 +2388,16 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
     const uint32_t tsz = t.byte_size();
     const bool may_overlap_rt = (uint64_t(t.address) + tsz > surf_lo_ && t.address < surf_hi_);
     VkImageView v = may_overlap_rt ? resolve_gpu_tex(t, color, depth, &terr) : VK_NULL_HANDLE;
+    int tex_path = 0;
     if (!v && !terr.empty()) return fail(terr);
     if (!v) {
-      v = (may_overlap_rt && composite_sources(t, d.color_base, tmp_sources_)) ? composite(t, tmp_sources_, &terr)
-                                                                               : texture(t, &terr);
+      if (may_overlap_rt && composite_sources(t, d.color_base, tmp_sources_)) { v = composite(t, tmp_sources_, &terr); tex_path = 1; }
+      else { v = texture(t, &terr); tex_path = 2; }
       if (!v) return fail(terr);
+    }
+    note_tex(u, t, tex_path);
+    if (dbg_vsm_ != 0 && t.format == 0x95) {
+      if (VkImageView cv = vsm_const_view(dbg_vsm_, t)) v = cv;
     }
     const VkSampler smp = sampler(t);
     infos[u] = {smp, v, VK_IMAGE_LAYOUT_GENERAL};
@@ -2338,6 +2478,7 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
 
   if (d.color_mask != 0 && !dummy_color) mark_dirty(color);
   if (depth && (d.depth_write || d.stencil_test)) mark_dirty(depth);
+  note_draw(d, color, depth, dummy_color, uint32_t(d.tris.size() / 3), "draw");
   return true;
 }
 
@@ -2347,6 +2488,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   InRenderer in_renderer;
   if (!g_guard_base.load()) g_guard_base = env.mem;
   out_tris = 0;
+  if (dbg_skip_draw(d)) return true;
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
   if (!env.vp) return fail("no vertex program bound");
   if (d.min_x >= d.max_x || d.min_y >= d.max_y) return true;
@@ -2431,11 +2573,16 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
     const uint32_t tsz = t.byte_size();
     const bool may_overlap_rt = (uint64_t(t.address) + tsz > surf_lo_ && t.address < surf_hi_);
     VkImageView v = may_overlap_rt ? resolve_gpu_tex(t, color, depth, &terr) : VK_NULL_HANDLE;
+    int tex_path = 0;
     if (!v && !terr.empty()) return fail(terr);
     if (!v) {
-      v = (may_overlap_rt && composite_sources(t, d.color_base, tmp_sources_)) ? composite(t, tmp_sources_, &terr)
-                                                                               : texture(t, &terr);
+      if (may_overlap_rt && composite_sources(t, d.color_base, tmp_sources_)) { v = composite(t, tmp_sources_, &terr); tex_path = 1; }
+      else { v = texture(t, &terr); tex_path = 2; }
       if (!v) return fail(terr);
+    }
+    note_tex(u, t, tex_path);
+    if (dbg_vsm_ != 0 && t.format == 0x95) {
+      if (VkImageView cv = vsm_const_view(dbg_vsm_, t)) v = cv;
     }
     const VkSampler smp = sampler(t);
     infos[u] = {smp, v, VK_IMAGE_LAYOUT_GENERAL};
@@ -2610,6 +2757,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
 
   if (d.color_mask != 0 && !dummy_color) mark_dirty(color);
   if (depth && (d.depth_write || d.stencil_test)) mark_dirty(depth);
+  note_draw(d, color, depth, dummy_color, n_idx / 3, "raw");
   return true;
 }
 
@@ -2625,7 +2773,10 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
   const uint32_t* r = env.regs;
   const uint32_t surf = r[m::SURFACE_FORMAT];
   const uint32_t color_fmt = surf & 0x1F, surf_type = (surf >> 8) & 0xF, depth_fmt = (surf >> 5) & 7;
-  if (surf_type == 2) return false;
+  if (surf_type == 2) {
+    if (trace_frame_) frame_trace_.push_back("CLEAR mask " + std::to_string(mask) + " REFUSED (swizzled surface -> CPU fallback)");
+    return false;
+  }
   const bool argb = color_fmt == 8 || color_fmt == 4 || color_fmt == 5;
   const bool abgr = color_fmt == 16 || color_fmt == 14 || color_fmt == 15;
   if (color_bits && !argb && !abgr) return false;
@@ -2692,6 +2843,13 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
       (!color || (w >= color->image.w && h >= color->image.h)) &&
       (!depth || (w >= depth->image.w && h >= depth->image.h));
 
+  if (trace_frame_) {
+    char b[300];
+    std::snprintf(b, sizeof b, "CLEAR mask %02X color %08X depth %08X (%ux%u) rect x%u+%u y%u+%u %s zval %08X", mask,
+                  color ? color->addr : 0u, depth ? depth->addr : 0u, depth ? depth->image.w : 0u,
+                  depth ? depth->image.h : 0u, x0, w, y0, h, full_clear ? "FULL" : "sub-rect", r[m::ZSTENCIL_CLEAR_VALUE]);
+    frame_trace_.push_back(b);
+  }
   if (full_clear) {
     if (color) color->needs_upload = false;
     if (depth) depth->needs_upload = false;
@@ -2842,6 +3000,16 @@ void VulkanRenderer::write_back(uint8_t* mem, const Buffer& readback,
           }
         }
       }
+      // Debug (F12 / PS3RECOMP_LUM_MODE): rescale the alpha (luminance) the CPU reads from the 32x16 auto-exposure
+      // targets, to see whether the game's exposure control reacts. 0=real 1=zero 2=x0.25 3=x4 4=x16.
+      if (dbg_lum_mode_ != 0 && w == 32 && h == 16 && s->addr >= 0x31400000u && s->addr < 0x31500000u) {
+        static const float k[5] = {1.0f, 0.0f, 0.25f, 4.0f, 16.0f};
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* p = mem + s->addr + size_t(y) * s->pitch + 4 * x;  // guest byte 0 = A
+            p[0] = uint8_t(std::min(255.0f, float(p[0]) * k[dbg_lum_mode_] + 0.5f));
+          }
+      }
     }
   }
 }
@@ -2933,8 +3101,395 @@ void VulkanRenderer::complete(FrameState& f) {
   if (done) done();
 }
 
+// ---- diagnostics ----------------------------------------------------------------------------------------
+// Returns true when the stepper wants this draw skipped. Also numbers the frame's scene draws.
+bool VulkanRenderer::dbg_skip_draw(const PreparedDraw& d) {
+  dbg_cur_idx_ = -1;
+  if (d.color_mask == 0 || uint64_t(d.surface_w) * d.surface_h < 1200000ull) return false;
+  const int idx = dbg_scene_idx_++;
+  dbg_cur_idx_ = idx;
+  return dbg_draw_limit_ >= 0 && idx >= dbg_draw_limit_;
+}
+
+// F6 debug: a 4x4 R16G16 image cleared to (0,0) (mode 1) or (1,1) (mode 2) standing in for the VSM atlas.
+VkImageView VulkanRenderer::vsm_const_view(int mode, const TexUnit& t) {
+  Image& im = vsm_const_[mode - 1];
+  if (!im.img) {
+    if (!make_image(im, 4, 4, VK_FORMAT_R16G16_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT))
+      return VK_NULL_HANDLE;
+    begin();
+    end_pass();  // the clear must be outside a render pass
+    transition_general(im.img, VK_IMAGE_ASPECT_COLOR_BIT);
+    barrier_all();
+    VkClearColorValue cv{};
+    cv.float32[0] = cv.float32[1] = mode == 2 ? 1.0f : 0.0f;
+    VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vk_.vkCmdClearColorImage(cmd_, im.img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
+    barrier_all();
+  }
+  return get_view(im, false, t.remap);
+}
+
+void VulkanRenderer::note_tex(uint32_t unit, const TexUnit& t, int path) {
+  ++tex_path_[path][t.format & 255];
+  if (trace_frame_ || dbg_draw_limit_ >= 0) {
+    char b[120];
+    std::snprintf(b, sizeof b, " t%u=%s:%02X@%08X/%ux%u", unit, path == 0 ? "GPU" : path == 1 ? "CMP" : "MEM", t.format,
+                  t.address, t.width, t.height);
+    cur_tex_trace_ += b;
+  }
+}
+
+void VulkanRenderer::note_draw(const PreparedDraw& d, Surface* color, Surface* depth, bool dummy_color, uint32_t tris,
+                               const char* kind) {
+  RtStat& st = rt_stats_[{dummy_color ? 0u : color->addr, depth ? depth->addr : 0u}];
+  ++st.draws;
+  st.tris += tris;
+  st.w = color->image.w;
+  st.h = color->image.h;
+  ++diag_draws_;
+  const bool step_wants = dbg_draw_limit_ >= 0 && dbg_cur_idx_ >= 0 && dbg_cur_idx_ >= dbg_draw_limit_ - 2 &&
+                          dbg_cur_idx_ < dbg_draw_limit_;
+  if (trace_frame_ || step_wants) {
+    char b[480];
+    std::snprintf(b, sizeof b,
+                  "#%u %s rt %08X%s %ux%u z %08X %ux%u (fb %ux%u) bounds x%d-%d y%d-%d vp scale %.1f,%.1f off %.1f,%.1f tris %u fp %016llX zt%d zw%d st%d cm%08X blend%d%s",
+                  diag_draws_, kind, color->addr, dummy_color ? "(dummy)" : "", color->image.w, color->image.h,
+                  depth ? depth->addr : 0u, depth ? depth->image.w : 0u, depth ? depth->image.h : 0u,
+                  depth ? std::min(color->image.w, depth->image.w) : color->image.w,
+                  depth ? std::min(color->image.h, depth->image.h) : color->image.h, d.min_x, d.max_x, d.min_y, d.max_y,
+                  d.vp_scale[0], d.vp_scale[1], d.vp_offset[0], d.vp_offset[1], tris,
+                  (unsigned long long)d.fp_hash, d.depth_test ? 1 : 0, d.depth_write ? 1 : 0, d.stencil_test ? 1 : 0,
+                  d.color_mask, d.blend ? 1 : 0, cur_tex_trace_.c_str());
+    if (trace_frame_) frame_trace_.push_back(b);
+    if (step_wants) (dbg_cur_idx_ == dbg_draw_limit_ - 1 ? dbg_last_desc_ : dbg_prev_desc_) = b;
+  }
+  cur_tex_trace_.clear();
+}
+
+void VulkanRenderer::diag_flip(uint8_t* mem) {
+  const auto now = std::chrono::steady_clock::now();
+  if (last_flip_t_.time_since_epoch().count() != 0) {
+    const double ms = std::chrono::duration<double, std::milli>(now - last_flip_t_).count();
+    if (ms < 500.0) {  // ignore loading stalls
+      ft_sum_ += ms;
+      ft_max_ = std::max(ft_max_, ms);
+      ++ft_n_;
+      if (ms > 20.0) ++ft_gt20_;
+      if (ms > 25.0) ++ft_gt25_;
+      if (ms > 34.0) ++ft_gt34_;
+    }
+  }
+  last_flip_t_ = now;
+
+  {  // test hook: PS3RECOMP_DEBUG_PRESS=f6@2300,f5@2400 presses the debug keys at those flips
+    static const std::vector<std::pair<uint64_t, int>> presses = [] {
+      std::vector<std::pair<uint64_t, int>> v;
+      const char* e = std::getenv("PS3RECOMP_DEBUG_PRESS");
+      std::string s = e ? e : "";
+      size_t p = 0;
+      while (p < s.size()) {
+        size_t c = s.find(',', p);
+        std::string item = s.substr(p, c == std::string::npos ? std::string::npos : c - p);
+        const size_t at = item.find('@');
+        if (at == 2 && item[0] == 'f') v.push_back({uint64_t(std::atoll(item.c_str() + 3)), item[1] - '0'});
+        if (c == std::string::npos) break;
+        p = c + 1;
+      }
+      return v;
+    }();
+    for (auto& [at, key] : presses) {
+      if (at != frame_seq_) continue;
+      if (key == 2) ++gfx::g_debug_f2;
+      else if (key == 3) ++gfx::g_debug_f3;
+      else if (key == 5) ++gfx::g_debug_f5;
+      else if (key == 6) ++gfx::g_debug_f6;
+      else if (key == 8) gfx::g_debug_f8 += 60;  // test hook: 60 presses of F8 (= 600 draws fewer)
+      else if (key == 1) ++gfx::g_debug_f11;     // test hook: "f1@N" starts the F11 sweep
+    }
+  }
+  {  // F2 / F3 debug toggles
+    const int f2 = gfx::g_debug_f2.load(), f3 = gfx::g_debug_f3.load();
+    if (f2 != seen_f2_ || f3 != seen_f3_) {
+      if (f2 != seen_f2_) dbg_border_ = (dbg_border_ + 1) % 3;
+      if (f3 != seen_f3_) dbg_clamp_off_ = !dbg_clamp_off_;
+      seen_f2_ = f2;
+      seen_f3_ = f3;
+      logf("[gpu] DEBUG toggles: shadow border = %s, depth clamp = %s", dbg_border_ == 0 ? "auto" : dbg_border_ == 1 ? "WHITE" : "BLACK",
+           dbg_clamp_off_ ? "OFF (clip)" : "on");
+    }
+    {  // F7/F8/F9 draw stepper
+      const int f7 = gfx::g_debug_f7.load(), f8 = gfx::g_debug_f8.load(), f9 = gfx::g_debug_f9.load();
+      if (f7 != seen_f7_) dbg_draw_limit_ = -1;
+      if (f8 != seen_f8_) {
+        if (dbg_draw_limit_ < 0) dbg_draw_limit_ = dbg_last_scene_draws_;
+        dbg_draw_limit_ = std::max(0, dbg_draw_limit_ - 10 * (f8 - seen_f8_));
+      }
+      if (f9 != seen_f9_ && dbg_draw_limit_ >= 0) {
+        dbg_draw_limit_ += 10 * (f9 - seen_f9_);
+        if (dbg_draw_limit_ >= dbg_last_scene_draws_) dbg_draw_limit_ = -1;
+      }
+      seen_f7_ = f7; seen_f8_ = f8; seen_f9_ = f9;
+      const int f11 = gfx::g_debug_f11.load();
+      if (f11 != seen_f11_) {
+        seen_f11_ = f11;
+        if (!scan_active_ && dbg_last_scene_draws_ > 0) {
+          namespace fs = std::filesystem;
+          wchar_t exe[MAX_PATH] = {};
+          GetModuleFileNameW(nullptr, exe, MAX_PATH);
+          char stamp[32];
+          std::time_t tt = std::time(nullptr);
+          std::strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", std::localtime(&tt));
+          const fs::path dir = fs::path(exe).parent_path() / "diagnostics" / (std::string("scan_") + stamp);
+          std::error_code ec;
+          fs::create_directories(dir, ec);
+          scan_dir_ = dir.string();
+          scan_text_.clear();
+          scan_active_ = true;
+          scan_limit_ = 0;
+          dbg_draw_limit_ = 0;  // frame after this flip renders no scene draws
+          logf("[gpu] SCAN: started, %d scene draws, writing to %s", dbg_last_scene_draws_, scan_dir_.c_str());
+        }
+      } else if (scan_active_) {
+        scan_step(mem);
+      }
+      if (dbg_draw_limit_ >= 0 && !scan_active_ && ++dbg_step_flips_ >= 15) {
+        dbg_step_flips_ = 0;
+        logf("[gpu] STEP: showing scene draws 1..%d of %d.  last drawn (#%d): %s", dbg_draw_limit_, dbg_last_scene_draws_,
+             dbg_draw_limit_, dbg_last_desc_.c_str());
+        logf("[gpu] STEP:   previous (#%d): %s", dbg_draw_limit_ - 1, dbg_prev_desc_.c_str());
+      } else if (dbg_draw_limit_ < 0 && dbg_step_flips_ != 0) {
+        dbg_step_flips_ = 0;
+        logf("[gpu] STEP: off (all %d scene draws shown)", dbg_last_scene_draws_);
+      }
+      if (dbg_scene_idx_ > 0) dbg_last_scene_draws_ = dbg_scene_idx_;
+      dbg_scene_idx_ = 0;
+    }
+    {
+      const int f12 = gfx::g_debug_f12.load();
+      if (f12 != seen_f12_) {
+        dbg_lum_mode_ = (dbg_lum_mode_ + (f12 - seen_f12_)) % 5;
+        seen_f12_ = f12;
+        static const char* nm[5] = {"real", "ZERO", "x0.25", "x4", "x16"};
+        logf("[gpu] DEBUG toggles: luminance the CPU reads = %s", nm[dbg_lum_mode_]);
+      }
+    }
+    const int f5 = gfx::g_debug_f5.load(), f6 = gfx::g_debug_f6.load();
+    if (f5 != seen_f5_ || f6 != seen_f6_) {
+      if (f5 != seen_f5_) dbg_cascade_lit_ = !dbg_cascade_lit_;
+      if (f6 != seen_f6_) dbg_vsm_ = (dbg_vsm_ + 1) % 3;
+      seen_f5_ = f5;
+      seen_f6_ = f6;
+      logf("[gpu] DEBUG toggles: depth-cascade shadows = %s, VSM atlas = %s", dbg_cascade_lit_ ? "FORCED LIT" : "real",
+           dbg_vsm_ == 0 ? "real" : dbg_vsm_ == 1 ? "REPLACED (0,0)" : "REPLACED (1,1)");
+    }
+  }
+
+  static const bool verbose = std::getenv("PS3RECOMP_FPS_LOG") != nullptr;
+  if (verbose && ++diag_flips_ >= 240) {
+    diag_flips_ = 0;
+    if (ft_n_)
+      logf("[gpu] frame pacing: %u flips avg %.1f ms max %.0f ms; >20ms %u, >25ms %u, >34ms %u", ft_n_, ft_sum_ / ft_n_,
+           ft_max_, ft_gt20_, ft_gt25_, ft_gt34_);
+    std::string rt;
+    for (auto& [k, st] : rt_stats_) {
+      char b[96];
+      std::snprintf(b, sizeof b, " [%08X/%08X %ux%u: %u draws %llu tris]", k.first, k.second, st.w, st.h, st.draws,
+                    (unsigned long long)st.tris);
+      rt += b;
+    }
+    logf("[gpu] draws per render target (last 240 flips):%s", rt.c_str());
+    std::string tx;
+    for (uint32_t f = 0; f < 256; ++f)
+      if (tex_path_[0][f] || tex_path_[1][f] || tex_path_[2][f]) {
+        char b[96];
+        std::snprintf(b, sizeof b, " 0x%02X(gpu %u, cmp %u, mem %u)", f, tex_path_[0][f], tex_path_[1][f], tex_path_[2][f]);
+        tx += b;
+      }
+    logf("[gpu] texture binds by format:%s", tx.c_str());
+    logf("[gpu] static texture cache: %u re-checks, %u stale textures refreshed (last 240 flips)", static_bc_checks_, static_bc_stale_);
+    static_bc_checks_ = static_bc_stale_ = 0;
+    ft_sum_ = ft_max_ = 0;
+    ft_n_ = ft_gt20_ = ft_gt25_ = ft_gt34_ = 0;
+    rt_stats_.clear();
+    std::memset(tex_path_, 0, sizeof tex_path_);
+  }
+
+  if (trace_frame_ && !frame_trace_.empty()) {  // the frame traced since the last flip is complete
+    std::ofstream f(std::filesystem::path(capture_dir_) / "frame_draws.txt");
+    f << "One frame of draws, in submission order (rt = colour target, z = depth target; texture paths: GPU = sampled from a\n"
+         "render-target surface, CMP = composite of surfaces, MEM = decoded from guest memory):\n";
+    for (auto& line : frame_trace_) f << line << "\n";
+    logf("[gpu] capture: wrote %zu draws to %s\\frame_draws.txt", frame_trace_.size(), capture_dir_.c_str());
+    frame_trace_.clear();
+    trace_frame_ = false;
+  }
+  static const uint64_t capture_at = [] {  // test hook: PS3RECOMP_CAPTURE_AT_FLIP=<flip number>
+    const char* e = std::getenv("PS3RECOMP_CAPTURE_AT_FLIP");
+    return e ? uint64_t(std::atoll(e)) : ~0ull;
+  }();
+  if (frame_seq_ == capture_at) ++gfx::g_capture_requests;
+  if (gfx::g_capture_requests.exchange(0) > 0) capture_surfaces(mem);
+}
+
+namespace {
+void write_bmp(const std::filesystem::path& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& bgr) {
+  const uint32_t row = (w * 3 + 3) & ~3u, size = row * h;
+  uint8_t hdr[54] = {'B', 'M'};
+  auto put32 = [&](int o, uint32_t v) { std::memcpy(hdr + o, &v, 4); };
+  put32(2, 54 + size); put32(10, 54); put32(14, 40); put32(18, w); put32(22, uint32_t(-int32_t(h)));  // top-down
+  hdr[26] = 1; hdr[28] = 24; put32(34, size);
+  std::ofstream f(path, std::ios::binary);
+  f.write(reinterpret_cast<const char*>(hdr), 54);
+  std::vector<uint8_t> line(row);
+  for (uint32_t y = 0; y < h; ++y) {
+    std::memcpy(line.data(), bgr.data() + size_t(y) * w * 3, size_t(w) * 3);
+    f.write(reinterpret_cast<const char*>(line.data()), row);
+  }
+}
+}  // namespace
+
+void VulkanRenderer::capture_surfaces(uint8_t* mem) {
+  namespace fs = std::filesystem;
+  static int n = 0;
+  wchar_t exe[MAX_PATH] = {};
+  GetModuleFileNameW(nullptr, exe, MAX_PATH);
+  char stamp[32];
+  std::time_t tt = std::time(nullptr);
+  std::strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", std::localtime(&tt));
+  const fs::path dir = fs::path(exe).parent_path() / "diagnostics" / (std::string("capture_") + stamp + "_" + std::to_string(++n));
+  std::error_code ec;
+  fs::create_directories(dir, ec);
+  capture_dir_ = dir.string();
+
+  flush_for(mem, true, kFlushExternal);  // every GPU-held surface back into guest memory
+  std::ofstream rep(dir / "report.txt");
+  rep << "frame_seq " << frame_seq_ << ", surfaces " << surfaces_.size() << ", evictions " << surf_evictions_ << "\n\n";
+  int idx = 0;
+  for (auto& sp : surfaces_) {
+    const Surface& s = *sp;
+    const uint32_t w = s.image.w, h = s.image.h;
+    char nm[96];
+    std::snprintf(nm, sizeof nm, "s%02d_%08X_%ux%u_%s", idx++, s.addr, w, h, s.depth ? "depth" : (s.argb ? "argb" : "abgr"));
+    rep << nm << "  pitch " << s.pitch << "  dirty " << s.dirty << "  needs_upload " << s.needs_upload << "  write_seq "
+        << s.write_seq << "  last_use " << s.last_use << " (frames ago " << frame_seq_ - s.last_use << ")\n";
+    if (!s.addr || !w || !h || w > 4096 || h > 4096) continue;
+    const uint8_t* base = mem + s.addr;
+    if (!s.depth) {  // per-channel stats over guest bytes b0..b3 (argb: A R G B, abgr: A B G R) and the first pixels' raw bytes
+      uint64_t sum[4] = {};
+      uint32_t mn[4] = {255, 255, 255, 255}, mx[4] = {};
+      uint64_t cnt = 0;
+      const uint32_t step = (w * h > 65536) ? 3 : 1;
+      for (uint32_t y = 0; y < h; y += step)
+        for (uint32_t x = 0; x < w; x += step) {
+          const uint8_t* p = base + size_t(y) * s.pitch + 4 * x;
+          for (int c = 0; c < 4; ++c) { sum[c] += p[c]; mn[c] = std::min<uint32_t>(mn[c], p[c]); mx[c] = std::max<uint32_t>(mx[c], p[c]); }
+          ++cnt;
+        }
+      const char* names = s.argb ? "A R G B" : "A B G R";
+      rep << "    bytes [" << names << "] mean";
+      for (int c = 0; c < 4; ++c) rep << " " << (cnt ? double(sum[c]) / double(cnt) : 0.0);
+      rep << "  min";
+      for (int c = 0; c < 4; ++c) rep << " " << mn[c];
+      rep << "  max";
+      for (int c = 0; c < 4; ++c) rep << " " << mx[c];
+      rep << "\n";
+      if (w * h <= 4096) {  // tiny targets (luminance chain): raw first row, hex per pixel
+        rep << "    first row (hex AARRGGBB-order bytes):";
+        for (uint32_t x = 0; x < std::min<uint32_t>(w, 16); ++x) {
+          const uint8_t* p = base + 4 * x;
+          char b[16];
+          std::snprintf(b, sizeof b, " %02X%02X%02X%02X", p[0], p[1], p[2], p[3]);
+          rep << b;
+        }
+        rep << "\n";
+      }
+    }
+    std::vector<uint8_t> a(size_t(w) * h * 3), b;
+    if (s.depth) {
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+          const uint8_t* p = base + size_t(y) * s.pitch + (s.depth_fmt == 1 ? 2 : 4) * x;
+          const uint8_t g = s.depth_fmt == 1 ? p[0] : p[0];  // most significant depth byte
+          uint8_t* o = &a[(size_t(y) * w + x) * 3];
+          o[0] = o[1] = o[2] = g;
+        }
+      write_bmp(dir / (std::string(nm) + ".bmp"), w, h, a);
+    } else if (s.argb) {
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+          const uint8_t* p = base + size_t(y) * s.pitch + 4 * x;  // guest bytes A R G B
+          uint8_t* o = &a[(size_t(y) * w + x) * 3];
+          o[0] = p[3]; o[1] = p[2]; o[2] = p[1];
+        }
+      write_bmp(dir / (std::string(nm) + ".bmp"), w, h, a);
+    } else {  // ABGR: also the Y16_X16 shadow atlas layout, so dump the two 16-bit channels' high bytes separately
+      b.assign(a.size(), 0);
+      for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+          const uint8_t* p = base + size_t(y) * s.pitch + 4 * x;  // guest bytes A B G R
+          uint8_t* o = &a[(size_t(y) * w + x) * 3];
+          uint8_t* q = &b[(size_t(y) * w + x) * 3];
+          o[0] = p[1]; o[1] = p[2]; o[2] = p[3];  // as-is colour: R=p3, G=p2, B=p1
+          q[0] = q[1] = q[2] = p[0];              // X16 high byte (alpha)
+        }
+      write_bmp(dir / (std::string(nm) + ".bmp"), w, h, a);
+      write_bmp(dir / (std::string(nm) + "_x16hi.bmp"), w, h, b);
+    }
+  }
+  rep << "\nconverted/composite caches: " << converted_.size() << " converted, " << composites_.size() << " composites\n";
+  trace_frame_ = true;  // the next frame's draws go to frame_draws.txt
+  frame_trace_.clear();
+  cur_tex_trace_.clear();
+  logf("[gpu] capture: %zu render targets written to %s; tracing the next frame", surfaces_.size(), capture_dir_.c_str());
+}
+
+// One step of the F11 sweep. The frame just recorded rendered only the first scan_limit_ scene draws; save the scene
+// target (half width: the main scene is 2x horizontally supersampled) and note which draw was the last one included.
+void VulkanRenderer::scan_step(uint8_t* mem) {
+  flush_for(mem, true, kFlushExternal);
+  const Surface* scene = nullptr;
+  for (auto& sp : surfaces_)
+    if (!sp->depth && sp->addr && (!scene || uint64_t(sp->image.w) * sp->image.h > uint64_t(scene->image.w) * scene->image.h))
+      scene = sp.get();
+  if (scene && scene->image.w <= 4096 && scene->image.h <= 4096) {
+    const uint32_t w = scene->image.w / 2, h = scene->image.h;
+    std::vector<uint8_t> bgr(size_t(w) * h * 3);
+    const uint8_t* base = mem + scene->addr;
+    for (uint32_t y = 0; y < h; ++y)
+      for (uint32_t x = 0; x < w; ++x) {
+        uint8_t* o = &bgr[(size_t(y) * w + x) * 3];
+        uint32_t acc[3] = {0, 0, 0};
+        for (uint32_t k = 0; k < 2; ++k) {
+          const uint8_t* p = base + size_t(y) * scene->pitch + 4 * (2 * x + k);
+          if (scene->argb) { acc[0] += p[3]; acc[1] += p[2]; acc[2] += p[1]; }   // A R G B -> B G R
+          else { acc[0] += p[1]; acc[1] += p[2]; acc[2] += p[3]; }               // A B G R
+        }
+        o[0] = uint8_t(acc[0] / 2); o[1] = uint8_t(acc[1] / 2); o[2] = uint8_t(acc[2] / 2);
+      }
+    char nm[48];
+    std::snprintf(nm, sizeof nm, "scan_%04d.bmp", scan_limit_);
+    write_bmp(std::filesystem::path(scan_dir_) / nm, w, h, bgr);
+  }
+  scan_text_ += "limit " + std::to_string(scan_limit_) + ": last drawn #" + std::to_string(scan_limit_) + ": " +
+                (scan_limit_ == 0 ? std::string("(none)") : dbg_last_desc_) + "\n";
+  scan_limit_ += 6;
+  if (scan_limit_ > dbg_last_scene_draws_ + 5) {
+    std::ofstream(std::filesystem::path(scan_dir_) / "scan.txt") << "scene draws per frame: " << dbg_last_scene_draws_ << "\n"
+                                                                  << scan_text_;
+    dbg_draw_limit_ = -1;
+    scan_active_ = false;
+    logf("[gpu] SCAN: finished, images + scan.txt in %s", scan_dir_.c_str());
+  } else {
+    dbg_draw_limit_ = scan_limit_;
+  }
+}
+
 void VulkanRenderer::flip_async(uint8_t* mem, uint32_t addr, uint32_t size, std::function<void()> done) {
   std::lock_guard<std::recursive_mutex> lk(m_);
+  ++frame_seq_;
+  diag_flip(mem);
   if (!recording_) {
     // Nothing new on the GPU: just make sure earlier frames are finished.
     drain();

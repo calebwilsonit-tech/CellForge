@@ -22,12 +22,15 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 namespace gfx {
+std::atomic<int> g_capture_requests{0};
+std::atomic<int> g_debug_f2{0}, g_debug_f3{0}, g_debug_f5{0}, g_debug_f6{0}, g_debug_f7{0}, g_debug_f8{0}, g_debug_f9{0}, g_debug_f11{0}, g_debug_f12{0};
 namespace {
 
 #define VK_GLOBAL_FUNCS(X) X(vkCreateInstance)
@@ -185,6 +188,23 @@ class VulkanPresenter final : public Presenter {
         }
         return 0;
       case WM_KEYDOWN:
+        {
+          // Renderer diagnostics hotkeys: only active when PS3RECOMP_DIAG is set (see the diag launchers).
+          static const bool diag_keys = std::getenv("PS3RECOMP_DIAG") != nullptr;
+          const bool fresh = !(lp & (1 << 30));  // ignore auto-repeat
+          if (diag_keys) {
+            if (wp == VK_F4 && fresh) { g_capture_requests.fetch_add(1); return 0; }
+            if (wp == VK_F2 && fresh) { g_debug_f2.fetch_add(1); return 0; }
+            if (wp == VK_F3 && fresh) { g_debug_f3.fetch_add(1); return 0; }
+            if (wp == VK_F5 && fresh) { g_debug_f5.fetch_add(1); return 0; }
+            if (wp == VK_F6 && fresh) { g_debug_f6.fetch_add(1); return 0; }
+            if (wp == VK_F7 && fresh) { g_debug_f7.fetch_add(1); return 0; }
+            if (wp == VK_F11 && fresh) { g_debug_f11.fetch_add(1); return 0; }
+            if (wp == VK_F12 && fresh) { g_debug_f12.fetch_add(1); return 0; }
+            if (wp == VK_F8) { g_debug_f8.fetch_add(1); return 0; }
+            if (wp == VK_F9) { g_debug_f9.fetch_add(1); return 0; }
+          }
+        }
         if (self && wp == VK_F1) {
           std::function<void()> fn;
           { std::lock_guard<std::mutex> lk(self->cb_m_); fn = self->on_settings_; }

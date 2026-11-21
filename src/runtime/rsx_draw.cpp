@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -749,6 +750,20 @@ bool prepare_draw_state(const DrawEnv& env, PreparedDraw& d, std::string* error)
   for (int k = 0; k < 3; ++k) {
     d.vp_scale[k] = fbits(r[m::VIEWPORT_SCALE + k]);
     d.vp_offset[k] = fbits(r[m::VIEWPORT_OFFSET + k]);
+  }
+  // The RSX clips primitives to the viewport rectangle. Our vertex shader maps into the whole surface, so
+  // without this a draw into one tile of a shared target (shadow-cascade atlas) leaks into its neighbours.
+  {
+    static const bool no_vp_clip = std::getenv("PS3RECOMP_NO_VP_CLIP") != nullptr;
+    const float sx = std::fabs(d.vp_scale[0]), sy = std::fabs(d.vp_scale[1]);
+    if (!no_vp_clip && std::isfinite(sx) && std::isfinite(sy) && sx >= 1.0f && sy >= 1.0f &&
+        std::isfinite(d.vp_offset[0]) && std::isfinite(d.vp_offset[1])) {
+      const int vx0 = int(std::lround((d.vp_offset[0] - sx) * float(aa_x))), vx1 = int(std::lround((d.vp_offset[0] + sx) * float(aa_x)));
+      const int vy0 = int(std::lround((d.vp_offset[1] - sy) * float(aa_y))), vy1 = int(std::lround((d.vp_offset[1] + sy) * float(aa_y)));
+      const int nx0 = std::max(d.min_x, vx0), nx1 = std::min(d.max_x, vx1);
+      const int ny0 = std::max(d.min_y, vy0), ny1 = std::min(d.max_y, vy1);
+      if (nx0 < nx1 && ny0 < ny1) { d.min_x = nx0; d.max_x = nx1; d.min_y = ny0; d.max_y = ny1; }
+    }
   }
 
   // ---- fragment program ----

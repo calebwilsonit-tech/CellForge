@@ -2,6 +2,7 @@
 // Puts finished frames on screen. The RSX emulation hands over 32-bit BGRA pixels
 // (host byte order: B, G, R, A) after each flip.
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -10,6 +11,19 @@
 #include <vector>
 
 namespace gfx {
+
+// F4 in the game window: asks the renderer for a diagnostic capture (render targets + draw list).
+extern std::atomic<int> g_capture_requests;
+// F2 / F3 debug toggles (press counters, read by the renderer): shadow-sampler border mode, depth clamp.
+extern std::atomic<int> g_debug_f2, g_debug_f3;
+// F5 / F6: neutralise the hardware depth-cascade shadows / the VSM atlas, to find which one darkens a scene.
+extern std::atomic<int> g_debug_f5, g_debug_f6;
+// F7 / F8 / F9: draw stepper (off / render fewer scene draws / render more). F8 and F9 auto-repeat.
+extern std::atomic<int> g_debug_f7, g_debug_f8, g_debug_f9;
+// F11: automatic draw-stepper sweep that saves the scene after each step (stand still, ~10 s).
+extern std::atomic<int> g_debug_f11;
+// F12: cycle the luminance value the CPU reads from the auto-exposure targets (real/zero/x0.25/x4/x16).
+extern std::atomic<int> g_debug_f12;
 
 class Presenter {
  public:
