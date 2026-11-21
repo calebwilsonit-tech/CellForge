@@ -48,7 +48,7 @@ namespace {
   X(vkDestroyDevice) X(vkGetDeviceQueue) X(vkQueueSubmit) X(vkDeviceWaitIdle) X(vkCreateCommandPool)     \
   X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer)      \
   X(vkResetCommandBuffer) X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer)    \
-  X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments)                        \
+  X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) X(vkCmdFillBuffer)     \
   X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)          \
   X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                \
   X(vkCmdSetBlendConstants) X(vkCmdSetDepthBias) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCreateBuffer)                           \
@@ -77,6 +77,11 @@ constexpr uint32_t kVertexFloats = 14 * 4;  // position + 13 varyings
 constexpr VkDeviceSize kUploadRing = 96ull << 20, kVertexRing = 96ull << 20, kIndexRing = 32ull << 20,
                        kConstRing = 64ull << 20, kReadbackRing = 64ull << 20;
 constexpr VkDeviceSize kVpUboSize = (2 + 512) * 16;  // vp_scale, vp_offset, c[512]
+// GPU frame-time timestamps are recorded when profiling or when PS3RECOMP_FPS_LOG asks for the periodic stats.
+inline bool ts_on() {
+  static const bool on = prof::enabled() || std::getenv("PS3RECOMP_FPS_LOG") != nullptr;
+  return on;
+}
 constexpr VkDeviceSize kFpUboRange = 16384;          // dynamic UBO window for FP inline constants
 constexpr uint32_t kMaxSetsPerFlush = 8192;
 
@@ -275,8 +280,48 @@ class VulkanRenderer final : public GpuRenderer {
   VkQueryPool ts_pool_ = VK_NULL_HANDLE;
   // Per-draw GPU timing (profiling): queries 3.. hold a timestamp after each draw.
   static constexpr uint32_t kTsQueries = 3 + 1024;  // two per draw: before and after
-  struct TsDraw { uint32_t fp; uint32_t tris; uint32_t w, h; };
+  // GPU clock keep-alive: laptop drivers drop the memory clock to a low power state (P5, 810 MHz) every couple of seconds when the
+  // GPU is lightly loaded, and the frames rendered while it ramps back are ~6x slower (visible as stutter). A short memory-bound
+  // fill at the end of every frame keeps the GPU busy enough that it stays in its high state.
+  Buffer keepalive_;
+  bool keepalive_init_ = false, discrete_gpu_ = false;
+  void keepalive_fill() {
+    if (!keepalive_init_) {
+      keepalive_init_ = true;
+      // On by default for discrete GPUs (256 MB per frame, ~1 ms of GPU time); PS3RECOMP_GPU_KEEPALIVE_MB=0 turns it off.
+      const char* e = std::getenv("PS3RECOMP_GPU_KEEPALIVE_MB");
+      const uint64_t mb = e ? std::strtoull(e, nullptr, 10) : (discrete_gpu_ ? 256 : 0);
+      if (!mb) return;
+      VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      bci.size = mb << 20;
+      bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      if (vk_.vkCreateBuffer(device_, &bci, nullptr, &keepalive_.buf) != VK_SUCCESS) { keepalive_ = Buffer{}; return; }
+      VkMemoryRequirements mr;
+      vk_.vkGetBufferMemoryRequirements(device_, keepalive_.buf, &mr);
+      VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+      mai.allocationSize = mr.size;
+      mai.memoryTypeIndex = memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+      if (mai.memoryTypeIndex == UINT32_MAX || vk_.vkAllocateMemory(device_, &mai, nullptr, &keepalive_.mem) != VK_SUCCESS) {
+        free_buffer(keepalive_);
+        return;
+      }
+      vk_.vkBindBufferMemory(device_, keepalive_.buf, keepalive_.mem, 0);
+      keepalive_.size = mb << 20;
+      logf("[gpu] GPU keep-alive fill: %llu MB per frame", (unsigned long long)mb);
+    }
+    if (keepalive_.buf) vk_.vkCmdFillBuffer(cmd_, keepalive_.buf, 0, keepalive_.size, uint32_t(frame_seq_));
+  }
+  struct TsDraw { uint32_t color, depth, w, h, kind; };  // one entry per render pass started (kind: 0 draw, 1 raw, 2 convert, 3 clear)
   std::vector<TsDraw> ts_draws_;
+  // GPU time per render-target pass (diagnostics): key (kind,color,depth) -> ms summed over spike / normal frames.
+  struct PassGpu { double spike_ms = 0, normal_ms = 0; uint32_t w = 0, h = 0; };
+  std::map<std::tuple<uint32_t, uint32_t, uint32_t>, PassGpu> pass_gpu_;
+  uint32_t gpu_spike_frames_ = 0, gpu_normal_frames_ = 0;
+  void ts_mark(uint32_t kind, uint32_t color, uint32_t depth, uint32_t w, uint32_t h) {
+    if (!ts_pool_ || !ts_on() || 3 + ts_draws_.size() >= kTsQueries) return;
+    vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, uint32_t(3 + ts_draws_.size()));
+    ts_draws_.push_back({color, depth, w, h, kind});
+  }
   float ts_period_ns_ = 1.0f;
   bool ts_valid_ = false;
   void invalidate(uint32_t addr, uint32_t size) override;
@@ -434,6 +479,24 @@ class VulkanRenderer final : public GpuRenderer {
   std::chrono::steady_clock::time_point last_flip_t_{};
   double ft_sum_ = 0, ft_max_ = 0;
   uint32_t ft_n_ = 0, ft_gt20_ = 0, ft_gt25_ = 0, ft_gt34_ = 0, diag_flips_ = 0, diag_draws_ = 0;
+  // Where the time goes in slow frames: synchronous flushes (by reason), the fence wait at flip, time inside draw().
+  double fl_ms_[6] = {};
+  uint32_t fl_n_[6] = {};
+  double fl_max_ms_ = 0;
+  double acc_flush_ = 0, acc_drain_ = 0, acc_draw_ = 0;
+  double slow_flush_ = 0, slow_drain_ = 0, slow_draw_ = 0, fast_flush_ = 0, fast_drain_ = 0, fast_draw_ = 0;
+  uint32_t slow_n_ = 0, fast_n_ = 0;
+  std::vector<float> gpu_hist_, lat_hist_;  // per completed frame: GPU execution ms, submit->complete ms
+  uint64_t seen_wait_us_ = 0;               // RSX thread time blocked waiting on the game (semaphore acquires)
+  double slow_wait_ = 0, fast_wait_ = 0, slow_vb_ = 0, fast_vb_ = 0, slow_busy_ = 0, fast_busy_ = 0, slow_draws_ = 0, fast_draws_ = 0;
+  uint64_t seen_vb_us_ = 0, seen_present_us_ = 0;
+  uint32_t seen_draws_ = 0;
+  struct DrawTimer {
+    double* acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit DrawTimer(double* a) : acc(a) {}
+    ~DrawTimer() { *acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+  };
   bool trace_frame_ = false;
   std::vector<std::string> frame_trace_;
   std::string cur_tex_trace_, capture_dir_;
@@ -558,6 +621,7 @@ bool VulkanRenderer::init() {
       if (score > best) {
         best = score; gpu_ = pd; queue_family_ = i; name_ = props.deviceName;
         ts_period_ns_ = props.limits.timestampPeriod;
+        discrete_gpu_ = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
         ts_valid_ = qf[i].timestampValidBits != 0;
         max_aniso_ = std::min(16.0f, std::max(1.0f, props.limits.maxSamplerAnisotropy));
       }
@@ -851,6 +915,7 @@ void VulkanRenderer::shutdown() {
     if (desc_pool_) vk_.vkDestroyDescriptorPool(device_, desc_pool_, nullptr);
     if (pipeline_layout_) vk_.vkDestroyPipelineLayout(device_, pipeline_layout_, nullptr);
     if (set_layout_) vk_.vkDestroyDescriptorSetLayout(device_, set_layout_, nullptr);
+    free_buffer(keepalive_);
     free_buffer(upload_);
     free_buffer(vertex_);
     free_buffer(index_);
@@ -1001,7 +1066,7 @@ void VulkanRenderer::begin() {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   vk_.vkBeginCommandBuffer(cmd_, &bi);
   recording_ = true;
-  if (ts_pool_ && prof::enabled()) {
+  if (ts_pool_ && ts_on()) {
     vk_.vkCmdResetQueryPool(cmd_, ts_pool_, 0, kTsQueries);
     ts_draws_.clear();
     vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ts_pool_, 0);
@@ -2186,6 +2251,7 @@ bool VulkanRenderer::run_convert_pass(Surface& src, ConvertedImage& dst, VkPipel
 
   begin();
   barrier_all();
+  ts_mark(2, src.addr, src.depth ? 1u : 0u, dst.image.w, dst.image.h);
   VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   rbi.renderPass = rp;
   rbi.framebuffer = dst.fb;
@@ -2315,6 +2381,7 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
   std::lock_guard<std::recursive_mutex> lk(m_);
   InRenderer in_renderer;
   if (!g_guard_base.load()) g_guard_base = env.mem;
+  DrawTimer draw_timer(&acc_draw_);
   if (d.tris.empty()) return true;
   if (dbg_skip_draw(d)) return true;
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
@@ -2446,6 +2513,7 @@ bool VulkanRenderer::draw(const DrawEnv& env, const PreparedDraw& d, std::string
   const VkFramebuffer fb = framebuffer(color, depth);
   if (!pass_open_ || pass_fb_ != fb || pass_rp_ != rp || pass_w_ != fw || pass_h_ != fh) {
     barrier_all();  // also ends the previous pass
+    ts_mark(0, dummy_color ? 0u : color->addr, depth ? depth->addr : 0u, fw, fh);
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp;
     rbi.framebuffer = fb;
@@ -2488,6 +2556,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   InRenderer in_renderer;
   if (!g_guard_base.load()) g_guard_base = env.mem;
   out_tris = 0;
+  DrawTimer draw_timer(&acc_draw_);
   if (dbg_skip_draw(d)) return true;
   auto fail = [&](const std::string& why) { if (error) *error = why; return false; };
   if (!env.vp) return fail("no vertex program bound");
@@ -2700,6 +2769,7 @@ bool VulkanRenderer::draw_raw(const DrawEnv& env, const DrawCall& call, const Pr
   const VkFramebuffer fb = framebuffer(color, depth);
   if (!pass_open_ || pass_fb_ != fb || pass_rp_ != rp || pass_w_ != fw || pass_h_ != fh) {
     barrier_all();
+    ts_mark(1, dummy_color ? 0u : color->addr, depth ? depth->addr : 0u, fw, fh);
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp;
     rbi.framebuffer = fb;
@@ -2897,6 +2967,7 @@ bool VulkanRenderer::clear(const DrawEnv& env, uint32_t mask) {
   const VkFramebuffer fb = framebuffer(fb_color, depth);
   if (!pass_open_ || pass_fb_ != fb || pass_rp_ != rp || pass_w_ != fw || pass_h_ != fh) {
     barrier_all();
+    ts_mark(3, color ? color->addr : 0u, depth ? depth->addr : 0u, fw, fh);
     VkRenderPassBeginInfo rbi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rbi.renderPass = rp;
     rbi.framebuffer = fb;
@@ -2933,6 +3004,10 @@ void VulkanRenderer::flush_for(uint8_t* mem, bool include_depth, FlushReason why
   static const bool full_sync = std::getenv("PS3RECOMP_FULL_SYNC") != nullptr;
   if (full_sync) { lo = 0; hi = ~0ull; }
   flush_impl(mem, include_depth, lo, hi);
+  {
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > 0.05) { fl_ms_[why] += ms; ++fl_n_[why]; fl_max_ms_ = std::max(fl_max_ms_, ms); acc_flush_ += ms; }
+  }
   if (prof::enabled())
     prof::record_call(10020 + why, 0,
                       uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count()),
@@ -3078,15 +3153,35 @@ void VulkanRenderer::complete(FrameState& f) {
   if (!f.in_flight) return;
   f.in_flight = false;
   vk_.vkWaitForFences(device_, 1, &f.fence, VK_TRUE, UINT64_MAX);
-  if (prof::enabled()) {
-    prof::record_call(10035, 0,
-                      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - f.t_submit).count()),
-                      "gpu:async-frame-latency");
+  if (ts_on()) {
+    const uint64_t lat_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - f.t_submit).count());
+    if (prof::enabled()) prof::record_call(10035, 0, lat_us, "gpu:async-frame-latency");
     uint64_t ts[3] = {};
     if (f.ts_pool && vk_.vkGetQueryPoolResults(device_, f.ts_pool, 0, 3, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-      prof::record_call(10033, 0, uint64_t(double(ts[1] - ts[0]) * ts_period_ns_ / 1000.0), "gpu:exec-frame-work");
-      prof::record_call(10034, uint32_t(f.pending.size()), uint64_t(double(ts[2] - ts[1]) * ts_period_ns_ / 1000.0),
-                        "gpu:exec-readback-copies");
+      const double work_us = double(ts[1] - ts[0]) * ts_period_ns_ / 1000.0, copy_us = double(ts[2] - ts[1]) * ts_period_ns_ / 1000.0;
+      if (prof::enabled()) {
+        prof::record_call(10033, 0, uint64_t(work_us), "gpu:exec-frame-work");
+        prof::record_call(10034, uint32_t(f.pending.size()), uint64_t(copy_us), "gpu:exec-readback-copies");
+      }
+      if (gpu_hist_.size() < 4096) { gpu_hist_.push_back(float((work_us + copy_us) / 1000.0)); lat_hist_.push_back(float(lat_us / 1000.0)); }
+      // Per render-pass GPU time: stamps 3.. mark the start of each pass; a pass lasts until the next stamp (or the frame-work stamp).
+      const size_t n = f.ts_draws.size();
+      if (n && f.ts_pool) {
+        std::vector<uint64_t> st(n);
+        if (vk_.vkGetQueryPoolResults(device_, f.ts_pool, 3, uint32_t(n), n * 8, st.data(), 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+          const bool spike = (work_us + copy_us) > 12000.0;
+          ++(spike ? gpu_spike_frames_ : gpu_normal_frames_);
+          for (size_t i = 0; i < n; ++i) {
+            const uint64_t end = i + 1 < n ? st[i + 1] : ts[1];
+            if (end < st[i]) continue;
+            const double ms = double(end - st[i]) * ts_period_ns_ / 1.0e6;
+            PassGpu& pg = pass_gpu_[{f.ts_draws[i].kind, f.ts_draws[i].color, f.ts_draws[i].depth}];
+            pg.w = f.ts_draws[i].w;
+            pg.h = f.ts_draws[i].h;
+            (spike ? pg.spike_ms : pg.normal_ms) += ms;
+          }
+        }
+      }
     }
   }
   if (f.mem) write_back(f.mem, f.readback, f.pending);
@@ -3179,8 +3274,20 @@ void VulkanRenderer::diag_flip(uint8_t* mem) {
       if (ms > 20.0) ++ft_gt20_;
       if (ms > 25.0) ++ft_gt25_;
       if (ms > 34.0) ++ft_gt34_;
+      const uint64_t wnow = gfx::g_rsx_wait_us.load(std::memory_order_relaxed);
+      const double wait_ms = double(wnow - seen_wait_us_) / 1000.0;
+      seen_wait_us_ = wnow;
+      const uint64_t vnow = gfx::g_rsx_vblank_wait_us.load(std::memory_order_relaxed);
+      const double vb_ms = double(vnow - seen_vb_us_) / 1000.0;
+      seen_vb_us_ = vnow;
+      const double ndraws = double(diag_draws_ - seen_draws_);
+      seen_draws_ = diag_draws_;
+      const double busy_ms = ms - wait_ms - vb_ms;  // RSX thread actually working (parse, pack, record, GPU waits)
+      if (ms > 25.0) { ++slow_n_; slow_flush_ += acc_flush_; slow_drain_ += acc_drain_; slow_draw_ += acc_draw_; slow_wait_ += wait_ms; slow_vb_ += vb_ms; slow_busy_ += busy_ms; slow_draws_ += ndraws; }
+      else { ++fast_n_; fast_flush_ += acc_flush_; fast_drain_ += acc_drain_; fast_draw_ += acc_draw_; fast_wait_ += wait_ms; fast_vb_ += vb_ms; fast_busy_ += busy_ms; fast_draws_ += ndraws; }
     }
   }
+  acc_flush_ = acc_drain_ = acc_draw_ = 0;
   last_flip_t_ = now;
 
   {  // test hook: PS3RECOMP_DEBUG_PRESS=f6@2300,f5@2400 presses the debug keys at those flips
@@ -3310,6 +3417,68 @@ void VulkanRenderer::diag_flip(uint8_t* mem) {
     logf("[gpu] texture binds by format:%s", tx.c_str());
     logf("[gpu] static texture cache: %u re-checks, %u stale textures refreshed (last 240 flips)", static_bc_checks_, static_bc_stale_);
     static_bc_checks_ = static_bc_stale_ = 0;
+    {
+      static const char* names[6] = {"external", "resize", "surface-limit", "texture-overlap", "rings", "upload"};
+      std::string fl;
+      for (int i = 0; i < 6; ++i)
+        if (fl_n_[i]) {
+          char b[96];
+          std::snprintf(b, sizeof b, " %s %ux/%.1fms", names[i], fl_n_[i], fl_ms_[i]);
+          fl += b;
+        }
+      logf("[gpu] sync flushes (last 240 flips, max single %.1f ms):%s", fl_max_ms_, fl.empty() ? " none" : fl.c_str());
+      logf("[gpu] per-frame ms  slow(>25ms, n=%u): flush %.2f flip %.2f draw() %.2f   |  fast (n=%u): flush %.2f flip %.2f draw() %.2f",
+           slow_n_, slow_n_ ? slow_flush_ / slow_n_ : 0.0, slow_n_ ? slow_drain_ / slow_n_ : 0.0, slow_n_ ? slow_draw_ / slow_n_ : 0.0,
+           fast_n_, fast_n_ ? fast_flush_ / fast_n_ : 0.0, fast_n_ ? fast_drain_ / fast_n_ : 0.0, fast_n_ ? fast_draw_ / fast_n_ : 0.0);
+      logf("[gpu] rsx thread blocked on the game (semaphore waits), avg ms/frame: slow %.2f  fast %.2f",
+           slow_n_ ? slow_wait_ / slow_n_ : 0.0, fast_n_ ? fast_wait_ / fast_n_ : 0.0);
+      auto pct = [](std::vector<float> v, double p) {
+        if (v.empty()) return 0.0f;
+        std::sort(v.begin(), v.end());
+        return v[std::min(v.size() - 1, size_t(p * v.size()))];
+      };
+      logf("[gpu] GPU execution ms per frame: p50 %.2f p90 %.2f p99 %.2f max %.2f | submit->complete ms: p50 %.2f p90 %.2f p99 %.2f max %.2f (n=%zu)",
+           pct(gpu_hist_, 0.5), pct(gpu_hist_, 0.9), pct(gpu_hist_, 0.99), pct(gpu_hist_, 1.0), pct(lat_hist_, 0.5), pct(lat_hist_, 0.9),
+           pct(lat_hist_, 0.99), pct(lat_hist_, 1.0), gpu_hist_.size());
+      gpu_hist_.clear();
+      lat_hist_.clear();
+      {
+        static const char* kn[4] = {"draw", "raw", "convert", "clear"};
+        auto top = [&](bool spike, uint32_t frames) {
+          std::vector<std::pair<double, std::string>> v;
+          for (auto& [k, pg] : pass_gpu_) {
+            const double ms = spike ? pg.spike_ms : pg.normal_ms;
+            if (!frames || ms / frames < 0.15) continue;
+            char b[120];
+            std::snprintf(b, sizeof b, " [%s %08X/%08X %ux%u: %.2f ms]", kn[std::get<0>(k) & 3], std::get<1>(k), std::get<2>(k), pg.w, pg.h, ms / frames);
+            v.push_back({ms, b});
+          }
+          std::sort(v.rbegin(), v.rend());
+          std::string s;
+          for (size_t i = 0; i < v.size() && i < 7; ++i) s += v[i].second;
+          return s;
+        };
+        logf("[gpu] GPU time per pass, SPIKE frames (>12 ms, n=%u, avg ms/frame):%s", gpu_spike_frames_, top(true, gpu_spike_frames_).c_str());
+        logf("[gpu] GPU time per pass, normal frames (n=%u, avg ms/frame):%s", gpu_normal_frames_, top(false, gpu_normal_frames_).c_str());
+        pass_gpu_.clear();
+        gpu_spike_frames_ = gpu_normal_frames_ = 0;
+      }
+      logf("[gpu] rsx thread per frame: slow: busy %.2f ms, vblank-wait %.2f ms, draws %.0f | fast: busy %.2f ms, vblank-wait %.2f ms, draws %.0f",
+           slow_n_ ? slow_busy_ / slow_n_ : 0.0, slow_n_ ? slow_vb_ / slow_n_ : 0.0, slow_n_ ? slow_draws_ / slow_n_ : 0.0,
+           fast_n_ ? fast_busy_ / fast_n_ : 0.0, fast_n_ ? fast_vb_ / fast_n_ : 0.0, fast_n_ ? fast_draws_ / fast_n_ : 0.0);
+      {
+        const uint64_t pn = gfx::g_rsx_present_us.load(), pm = gfx::g_rsx_present_max_us.exchange(0);
+        logf("[gpu] Presenter::present on the RSX thread: avg %.2f ms/flip, longest %.1f ms", double(pn - seen_present_us_) / 1000.0 / 240.0,
+             double(pm) / 1000.0);
+        seen_present_us_ = pn;
+      }
+      slow_wait_ = fast_wait_ = slow_vb_ = fast_vb_ = slow_busy_ = fast_busy_ = slow_draws_ = fast_draws_ = 0;
+      std::memset(fl_ms_, 0, sizeof fl_ms_);
+      std::memset(fl_n_, 0, sizeof fl_n_);
+      fl_max_ms_ = 0;
+      slow_n_ = fast_n_ = 0;
+      slow_flush_ = slow_drain_ = slow_draw_ = fast_flush_ = fast_drain_ = fast_draw_ = 0;
+    }
     ft_sum_ = ft_max_ = 0;
     ft_n_ = ft_gt20_ = ft_gt25_ = ft_gt34_ = 0;
     rt_stats_.clear();
@@ -3490,6 +3659,11 @@ void VulkanRenderer::flip_async(uint8_t* mem, uint32_t addr, uint32_t size, std:
   std::lock_guard<std::recursive_mutex> lk(m_);
   ++frame_seq_;
   diag_flip(mem);
+  struct DrainTimer {  // time spent waiting on the older frame's fence (accounted to the next interval)
+    double* acc;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~DrainTimer() { *acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+  } drain_timer{&acc_drain_};
   if (!recording_) {
     // Nothing new on the GPU: just make sure earlier frames are finished.
     drain();
@@ -3502,14 +3676,15 @@ void VulkanRenderer::flip_async(uint8_t* mem, uint32_t addr, uint32_t size, std:
     return;
   }
   end_pass();
-  if (ts_pool_ && prof::enabled()) {
+  if (ts_pool_ && ts_on()) {
     barrier_all();
     vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 1);
   }
   static const bool full_sync = std::getenv("PS3RECOMP_FULL_SYNC") != nullptr;
   record_readbacks(full_sync ? 0 : addr, full_sync ? ~0ull : uint64_t(addr) + size, false);
   barrier_all();
-  if (ts_pool_ && prof::enabled()) vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 2);
+  if (ts_pool_ && ts_on()) vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 2);
+  keepalive_fill();
   vk_.vkEndCommandBuffer(cmd_);
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.commandBufferCount = 1;
@@ -3641,13 +3816,13 @@ void VulkanRenderer::flush_impl(uint8_t* mem, bool include_depth, uint64_t lo, u
   if (!recording_) begin();
   end_pass();
 
-  if (ts_pool_ && prof::enabled()) {
+  if (ts_pool_ && ts_on()) {
     barrier_all();
     vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 1);
   }
   record_readbacks(lo, hi, include_depth);
   barrier_all();
-  const bool timed = ts_pool_ && prof::enabled();
+  const bool timed = ts_pool_ && ts_on();
   if (timed) vk_.vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ts_pool_, 2);
   vk_.vkEndCommandBuffer(cmd_);
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};

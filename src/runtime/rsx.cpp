@@ -337,9 +337,12 @@ void Rsx::flip(uint32_t id, bool immediate) {
     uint64_t vb = stats.vblanks.load();
     if (vb == last_flip_vblank_) {
       poll_gpu();
+      const auto vw0 = Clock::now();
       std::unique_lock<std::mutex> lk(vblank_m_);
       vblank_cv_.wait(lk, [&] { return stop_.load() || stats.vblanks.load() != last_flip_vblank_; });
       vb = stats.vblanks.load();
+      gfx::g_rsx_vblank_wait_us.fetch_add(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - vw0).count()), std::memory_order_relaxed);
     }
     poll_gpu();
     last_flip_vblank_ = vb;
@@ -471,7 +474,14 @@ void Rsx::present_display(const DisplayBuffer& d, uint32_t base, uint64_t flip_n
     }
   }
   if (p) {
+    const auto pt0 = Clock::now();
     p->present(frame_.data(), d.width, d.height, d.width);
+    {
+      const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - pt0).count());
+      gfx::g_rsx_present_us.fetch_add(us, std::memory_order_relaxed);
+      uint64_t mx = gfx::g_rsx_present_max_us.load(std::memory_order_relaxed);
+      while (us > mx && !gfx::g_rsx_present_max_us.compare_exchange_weak(mx, us, std::memory_order_relaxed)) {}
+    }
     if (!p->alive()) {
       K().logf("window closed, exiting");
       std::fflush(nullptr);
@@ -547,9 +557,11 @@ void Rsx::execute(uint32_t method, uint32_t value) {
         if ((spin & 63) == 0) poll_gpu();
         spin < 4000 ? std::this_thread::yield() : std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      if (prof::enabled())
-        prof::record_call(10001, semaphore_offset_406e_ / 16,
-                          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count()), "rsx:acquire");
+      {
+        const uint64_t waited_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
+        gfx::g_rsx_wait_us.fetch_add(waited_us, std::memory_order_relaxed);
+        if (prof::enabled()) prof::record_call(10001, semaphore_offset_406e_ / 16, waited_us, "rsx:acquire");
+      }
       break;
     }
     case M_SEMAPHORE_RELEASE: {

@@ -22,6 +22,12 @@ extern std::atomic<int> g_debug_f5, g_debug_f6;
 extern std::atomic<int> g_debug_f7, g_debug_f8, g_debug_f9;
 // F11: automatic draw-stepper sweep that saves the scene after each step (stand still, ~10 s).
 extern std::atomic<int> g_debug_f11;
+// Microseconds the RSX thread has spent blocked on semaphore acquires (= waiting for the game's PPU/SPU work). Diagnostics.
+extern std::atomic<uint64_t> g_rsx_wait_us;
+// Microseconds the RSX thread has spent waiting for the emulated VBlank at flips. Diagnostics.
+extern std::atomic<uint64_t> g_rsx_vblank_wait_us;
+// Microseconds the RSX thread has spent inside Presenter::present (total, and the longest single call). Diagnostics.
+extern std::atomic<uint64_t> g_rsx_present_us, g_rsx_present_max_us;
 // F12: cycle the luminance value the CPU reads from the auto-exposure targets (real/zero/x0.25/x4/x16).
 extern std::atomic<int> g_debug_f12;
 

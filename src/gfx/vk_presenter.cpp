@@ -30,6 +30,9 @@
 
 namespace gfx {
 std::atomic<int> g_capture_requests{0};
+std::atomic<uint64_t> g_rsx_wait_us{0};
+std::atomic<uint64_t> g_rsx_vblank_wait_us{0};
+std::atomic<uint64_t> g_rsx_present_us{0}, g_rsx_present_max_us{0};
 std::atomic<int> g_debug_f2{0}, g_debug_f3{0}, g_debug_f5{0}, g_debug_f6{0}, g_debug_f7{0}, g_debug_f8{0}, g_debug_f9{0}, g_debug_f11{0}, g_debug_f12{0};
 namespace {
 
