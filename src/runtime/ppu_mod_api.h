@@ -34,6 +34,14 @@ struct Ps3RecompModApi {
   void (*unhook)(uint32_t addr);                   // restore the recompiled original
   void (*call)(ppu::Context& c, uint32_t addr);    // call any guest function by address
   void (*log)(const char* msg);
+  // Appended after v1 (older mods never read it): code address of an imported HLE function, for hook().
+  // `name` is a function name or "nid:0xXXXXXXXX". Returns 0 if the game doesn't import it.
+  uint32_t (*hle_code)(const char* module, const char* name);
+  // Permanent zero-initialised guest memory (never freed) for strings, structs and buffers handed to the game. 0 on failure.
+  uint32_t (*guest_alloc)(uint32_t size, uint32_t align);
+  // Guest function descriptor (OPD) whose code is the host function `fn`: a pointer the game can call, store in a
+  // vtable or hand back as a callback. 0 on failure.
+  uint32_t (*make_opd)(ppu::Fn fn);
 };
 
 #if defined(_WIN32)

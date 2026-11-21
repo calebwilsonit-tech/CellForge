@@ -223,6 +223,18 @@ uint32_t import_opd(const std::string& module, const std::string& name) {
   return it == g_opds.end() ? 0 : it->second;
 }
 
+uint32_t import_code(const std::string& module, const std::string& name) {
+  const uint32_t n = name.rfind("nid:", 0) == 0 ? uint32_t(std::strtoul(name.c_str() + 4, nullptr, 16)) : nid::of(name);
+  uint32_t opd;
+  {
+    std::lock_guard<std::mutex> lk(g_m);
+    auto it = g_opds.find({module, n});
+    if (it == g_opds.end()) return 0;
+    opd = it->second;
+  }
+  return ppu::ld32(lv2::Kernel::get().base(), opd);
+}
+
 // ---- printf -------------------------------------------------------------------
 std::string format_guest(ppu::Context& c, uint32_t fmt_addr, int gpr, int fpr) {
   lv2::Kernel& k = lv2::Kernel::get();

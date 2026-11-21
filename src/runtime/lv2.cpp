@@ -1074,6 +1074,19 @@ bool event_queue_send_by_key(uint64_t key, uint64_t source, uint64_t d1, uint64_
   return true;
 }
 
+#if defined(_WIN32)
+// Reads a guest word without letting a bad address take the crash reporter down with it.
+static uint32_t safe_peek32(uint8_t* base, uint32_t a) {
+  __try {
+    return ppu::ld32(base, a);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return 0xDEADBEEFu;
+  }
+}
+#else
+static uint32_t safe_peek32(uint8_t* base, uint32_t a) { return ppu::ld32(base, a); }
+#endif
+
 // Registers plus a guest call trace from the stack back-chain: each PPC64 frame
 // holds the caller's r1 at +0 and the saved LR at +16 of the caller's frame.
 void Kernel::dump_context(const ppu::Context& c) {
@@ -1083,6 +1096,29 @@ void Kernel::dump_context(const ppu::Context& c) {
     logf("  r%-2d=%016llX r%-2d=%016llX r%-2d=%016llX r%-2d=%016llX", i, (unsigned long long)c.r[i], i + 1,
          (unsigned long long)c.r[i + 1], i + 2, (unsigned long long)c.r[i + 2], i + 3, (unsigned long long)c.r[i + 3]);
   logf("  guest call trace (saved LRs):%s", guest_trace(uint32_t(c.r[1])).c_str());
+  // Object contents for registers that point into the guest heap: shows a fault's object and its vtable entries.
+  for (int reg : {25, 29, 30, 31, 3}) {
+    const uint32_t a = uint32_t(c.r[reg]);
+    if (a < 0x20000000u || a >= 0x3FFFFE00u || (a & 3)) continue;
+    std::string line;
+    char buf[16];
+    for (uint32_t off = 0; off < 0x140; off += 4) {
+      std::snprintf(buf, sizeof buf, "%08X ", safe_peek32(base(), a + off));
+      line += buf;
+      if ((off & 0x1F) == 0x1C) { logf("  mem r%d+0x%03X: %s", reg, off - 0x1C, line.c_str()); line.clear(); }
+    }
+    if (!line.empty()) logf("  mem r%d: %s", reg, line.c_str());
+    const uint32_t vt = safe_peek32(base(), a);
+    if (vt >= 0x10000u && vt < 0x01900000u) {
+      line.clear();
+      for (uint32_t off = 0; off < 0x80; off += 4) {
+        const uint32_t opd = safe_peek32(base(), vt + off);
+        std::snprintf(buf, sizeof buf, "%08X ", (opd >= 0x10000u && opd < 0x01900000u) ? safe_peek32(base(), opd) : 0u);
+        line += buf;
+      }
+      logf("  vtable of r%d (0x%08X) code entries: %s", reg, vt, line.c_str());
+    }
+  }
 }
 
 std::string Kernel::guest_trace(uint32_t sp) {

@@ -1,6 +1,9 @@
 #include "ppu_mod_api.h"
+#include "hle.h"
+#include "lv2.h"
 #include "options.h"
 
+#include <cstring>
 #include <filesystem>
 #include <mutex>
 #include <string>
@@ -28,6 +31,13 @@ Fn api_hook(uint32_t addr, Fn fn) { return hook_function(addr, fn); }
 void api_unhook(uint32_t addr) { unhook_function(addr); }
 void api_call(Context& c, uint32_t addr) { call_indirect(c, addr); }
 void api_log(const char* msg) { log_msg(std::string("[mod] ") + msg); }
+uint32_t api_guest_alloc(uint32_t size, uint32_t align) {
+  const uint32_t a = lv2::Kernel::get().hle.alloc(size, align ? align : 16);
+  if (a) std::memset(lv2::Kernel::get().base() + a, 0, size);
+  return a;
+}
+uint32_t api_make_opd(Fn fn) { return hle::make_opd(fn); }
+uint32_t api_hle_code(const char* module, const char* name) { return hle::import_code(module ? module : "", name ? name : ""); }
 
 using InitFn = int (*)(const Ps3RecompModApi*);
 
@@ -82,7 +92,7 @@ std::vector<ModStatus> get_mod_status_list() {
 int load_mods(const char* dir, uint8_t* guest_base, void (*log)(const char*)) {
   g_log = log;
   static Ps3RecompModApi api;
-  api = Ps3RecompModApi{PS3RECOMP_MOD_API_VERSION, guest_base, api_hook, api_unhook, api_call, api_log};
+  api = Ps3RecompModApi{PS3RECOMP_MOD_API_VERSION, guest_base, api_hook, api_unhook, api_call, api_log, api_hle_code, api_guest_alloc, api_make_opd};
 
   std::vector<ModStatus> statuses;
   int loaded = 0;

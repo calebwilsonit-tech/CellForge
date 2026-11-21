@@ -83,6 +83,13 @@ struct Ps3RecompModApi {
   void (*unhook)(uint32_t addr);                 // Restore original recompiled function
   void (*call)(ppu::Context& c, uint32_t addr);  // Call any guest function by PS3 address
   void (*log)(const char* msg);                  // Write a message to the CellForge runtime log
+  // Added after v1 (check for nullptr on very old runtimes): code address of an imported HLE function
+  // (module e.g. "sys_net", name or "nid:0xXXXXXXXX") to pass to hook(). 0 if the game doesn't import it.
+  uint32_t (*hle_code)(const char* module, const char* name);
+  // Permanent zero-initialised guest memory (never freed) for strings/structs/buffers handed to the game. 0 on failure.
+  uint32_t (*guest_alloc)(uint32_t size, uint32_t align);
+  // Guest function descriptor (OPD) whose code is the host function `fn` (for vtables / callbacks). 0 on failure.
+  uint32_t (*make_opd)(ppu::Fn fn);
 };
 
 #if defined(_WIN32)
@@ -165,6 +172,20 @@ class Hook {
   uint32_t addr_ = 0;
   ppu::Fn orig_ = nullptr;
 };
+
+// Hooks an imported system-library (HLE) function such as sys_net::socket. Returns the previous implementation
+// (the runtime's built-in one or the "unimplemented import" stub), or nullptr if the game doesn't import it.
+inline ppu::Fn hook_import(const char* module, const char* name, ppu::Fn replacement) {
+  if (!g_api || !g_api->hle_code) return nullptr;
+  const uint32_t code = g_api->hle_code(module, name);
+  return code ? g_api->hook(code, replacement) : nullptr;
+}
+
+inline uint32_t make_opd(ppu::Fn fn) { return (g_api && g_api->make_opd) ? g_api->make_opd(fn) : 0; }
+
+inline uint32_t guest_alloc(uint32_t size, uint32_t align = 16) {
+  return (g_api && g_api->guest_alloc) ? g_api->guest_alloc(size, align) : 0;
+}
 
 // ---- Big-Endian PS3 Guest Memory Read / Write ------------------------------
 inline uint8_t read_u8(uint32_t ea) { return guest_base()[ea]; }

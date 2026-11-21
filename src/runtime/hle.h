@@ -54,6 +54,10 @@ ppu::Fn lookup(const std::string& module, const std::string& name);
 // Guest address of the HLE OPD for module/name, 0 if that import wasn't resolved.
 uint32_t import_opd(const std::string& module, const std::string& name);
 
+// Function-table code address of an imported function (what ppu::hook_function takes), found by module + name
+// or, when `name` is "nid:0xXXXXXXXX", by NID. 0 if the game doesn't import it.
+uint32_t import_code(const std::string& module, const std::string& name);
+
 // Hook point used by the built-in modules for _sys_printf & co.
 std::string format_guest(ppu::Context& c, uint32_t fmt_addr, int first_gpr, int first_fpr = 1);
 

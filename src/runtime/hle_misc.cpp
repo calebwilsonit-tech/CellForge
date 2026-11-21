@@ -4,12 +4,19 @@
 // uninitialised memory.
 
 #define _CRT_SECURE_NO_WARNINGS
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #include "hle.h"
 #include "lv2.h"
@@ -81,35 +88,156 @@ void cellNetCtlGetNatInfo(ppu::Context& c) {
 }
 void cellNetCtlAddHandler(ppu::Context& c) { K().w32(a32(c, 2), 1); ok(c); }  // (handler, arg, s32* hid)
 
-// ---- cellOskDialog (in cellSysutil): no keyboard UI; text is confirmed at once ----
-// Result text: the game's initial text, else PS3RECOMP_OSK_TEXT, else "Recomp".
-// Events: LOADED 0x0502, INPUT_ENTERED 0x0505, FINISHED 0x0503, UNLOADED 0x0504.
+// ---- cellOskDialog (in cellSysutil): a real text-entry window --------------------
+// The PS3 on-screen keyboard is replaced by a small native dialog (type with the PC keyboard, Enter = OK,
+// Esc = cancel). Events: LOADED 0x0502, FINISHED 0x0503 (param: 0 confirmed, 1 cancelled, 2 aborted),
+// UNLOADED 0x0504, INPUT_ENTERED 0x0505. PS3RECOMP_OSK_TEXT answers instantly without a window (automated runs).
 std::u16string g_osk_text;
-void cellOskDialogLoadAsync(ppu::Context& c) {  // (container, CellOskDialogParam*, CellOskDialogInputFieldInfo*)
-  g_osk_text.clear();
-  if (const uint32_t info = a32(c, 2)) {
-    // CellOskDialogInputFieldInfo: u16* message, u16* init_text, u32 limit_length (UTF-16 big-endian)
-    if (const uint32_t init = K().r32(info + 4))
-      for (uint32_t i = 0; i < 512; ++i) {
-        const uint16_t ch = K().r16(init + 2 * i);
-        if (!ch) break;
-        g_osk_text.push_back(char16_t(ch));
+std::atomic<int> g_osk_result{0};  // CellOskDialogInputFieldResult: 0 OK, 1 canceled, 2 aborted, 3 no text
+std::atomic<bool> g_osk_open{false};
+std::atomic<void*> g_osk_hwnd{nullptr};
+
+std::u16string read_guest_u16(uint32_t addr, uint32_t max_chars) {
+  std::u16string s;
+  if (!addr) return s;
+  for (uint32_t i = 0; i < max_chars; ++i) {
+    const uint16_t ch = K().r16(addr + 2 * i);
+    if (!ch) break;
+    s.push_back(char16_t(ch));
+  }
+  return s;
+}
+
+void osk_finish(int result, const std::u16string& text) {
+  g_osk_text = text;
+  g_osk_result = result;
+  if (result == 0) queue_sysutil_event(0x0505, 0);
+  queue_sysutil_event(0x0503, result == 0 ? 0 : result);
+  g_osk_open = false;
+}
+
+#if defined(_WIN32)
+struct OskDlg {
+  std::wstring title, init;
+  uint32_t limit = 0;
+  HWND edit = nullptr;
+  int result = 1;
+  std::u16string text;
+  bool done = false;
+};
+
+LRESULT CALLBACK osk_proc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  auto* d = reinterpret_cast<OskDlg*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+  switch (m) {
+    case WM_COMMAND:
+      if (d && LOWORD(w) == IDOK) {
+        const int n = GetWindowTextLengthW(d->edit);
+        std::wstring t(size_t(n) + 1, L'\0');
+        GetWindowTextW(d->edit, t.data(), n + 1);
+        t.resize(size_t(n));
+        d->text.assign(t.begin(), t.end());
+        d->result = d->text.empty() ? 3 : 0;
+        d->done = true;
+        return 0;
       }
+      if (d && LOWORD(w) == IDCANCEL) { d->result = 1; d->done = true; return 0; }
+      break;
+    case WM_CLOSE:
+      if (d) { d->result = g_osk_result.load() == 2 ? 2 : 1; d->done = true; }
+      return 0;
   }
-  if (g_osk_text.empty()) {
-    const char* env = std::getenv("PS3RECOMP_OSK_TEXT");
-    for (const char* p = env ? env : "Recomp"; *p; ++p) g_osk_text.push_back(char16_t(uint8_t(*p)));
+  return DefWindowProcW(h, m, w, l);
+}
+
+void osk_thread(OskDlg dlg, HWND owner) {
+  static const wchar_t* kClass = L"CellForgeOskDialog";
+  static const bool registered = [] {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = osk_proc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+    wc.hbrBackground = reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_BTNFACE + 1));
+    wc.lpszClassName = kClass;
+    return RegisterClassW(&wc) != 0;
+  }();
+  (void)registered;
+  NONCLIENTMETRICSW ncm{};
+  ncm.cbSize = sizeof ncm;
+  SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
+  ncm.lfMessageFont.lfHeight = ncm.lfMessageFont.lfHeight * 5 / 4;
+  HFONT font = CreateFontIndirectW(&ncm.lfMessageFont);
+
+  const int W = 460, H = 190;
+  RECT r{};
+  if (!(owner && GetWindowRect(owner, &r))) r = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+  const int x = r.left + ((r.right - r.left) - W) / 2, y = r.top + ((r.bottom - r.top) - H) / 2;
+  HWND h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT, kClass, dlg.title.c_str(),
+                           WS_POPUP | WS_CAPTION | WS_SYSMENU, x, y, W, H, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+  if (!h) { osk_finish(1, u""); return; }
+  SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&dlg));
+  auto mk = [&](const wchar_t* cls, const wchar_t* text, DWORD style, int cx, int cy, int cw, int ch, int id, DWORD ex = 0) {
+    HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, cx, cy, cw, ch, h,
+                             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+    SendMessageW(c, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+    return c;
+  };
+  mk(L"STATIC", dlg.title.c_str(), SS_LEFT, 16, 14, W - 48, 24, 100);
+  dlg.edit = mk(L"EDIT", dlg.init.c_str(), WS_TABSTOP | ES_AUTOHSCROLL, 16, 48, W - 48, 28, 101, WS_EX_CLIENTEDGE);
+  if (dlg.limit) SendMessageW(dlg.edit, EM_LIMITTEXT, dlg.limit, 0);
+  mk(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, W - 48 - 176, 96, 80, 30, IDOK);
+  mk(L"BUTTON", L"Cancel", WS_TABSTOP | BS_PUSHBUTTON, W - 48 - 88, 96, 80, 30, IDCANCEL);
+  ShowWindow(h, SW_SHOW);
+  SetForegroundWindow(h);
+  SetFocus(dlg.edit);
+  SendMessageW(dlg.edit, EM_SETSEL, 0, -1);
+  g_osk_hwnd = h;
+  MSG msg;
+  while (!dlg.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+    if (!IsDialogMessageW(h, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
   }
-  K().logf("on-screen keyboard: answered with %zu character(s)", g_osk_text.size());
+  g_osk_hwnd = nullptr;
+  DestroyWindow(h);
+  DeleteObject(font);
+  if (owner) SetForegroundWindow(owner);
+  osk_finish(dlg.result, dlg.text);
+}
+#endif
+
+void cellOskDialogLoadAsync(ppu::Context& c) {  // (container, CellOskDialogParam*, CellOskDialogInputFieldInfo*)
+  // CellOskDialogInputFieldInfo: u16* message, u16* init_text, u32 limit_length (UTF-16 big-endian)
+  std::u16string message, init;
+  uint32_t limit = 0;
+  if (const uint32_t info = a32(c, 2)) {
+    message = read_guest_u16(K().r32(info), 128);
+    init = read_guest_u16(K().r32(info + 4), 512);
+    limit = K().r32(info + 8);
+  }
   queue_sysutil_event(0x0502, 0);
-  queue_sysutil_event(0x0505, 0);
-  queue_sysutil_event(0x0503, 0);
+  if (g_osk_open.exchange(true)) { ok(c); return; }
+  if (const char* env = std::getenv("PS3RECOMP_OSK_TEXT")) {  // automated runs: no window
+    std::u16string t;
+    for (const char* p = env; *p; ++p) t.push_back(char16_t(uint8_t(*p)));
+    K().logf("on-screen keyboard: answered with PS3RECOMP_OSK_TEXT (%zu character(s))", t.size());
+    osk_finish(0, t);
+    ok(c);
+    return;
+  }
+#if defined(_WIN32)
+  OskDlg dlg;
+  dlg.title = message.empty() ? L"Enter text" : std::wstring(message.begin(), message.end());
+  dlg.init.assign(init.begin(), init.end());
+  dlg.limit = limit;
+  K().logf("on-screen keyboard: showing a text entry window (limit %u)", limit);
+  std::thread(osk_thread, std::move(dlg), GetForegroundWindow()).detach();
+#else
+  osk_finish(0, init.empty() ? u"Recomp" : init);
+#endif
   ok(c);
 }
 // CellOskDialogCallbackReturnParam: s32 result, s32 numCharsResultString (capacity), u16* pResultString
 void write_osk_result(uint32_t out) {
   if (!out) return;
-  K().w32(out, 0);  // CELL_OSKDIALOG_INPUT_FIELD_RESULT_OK
+  K().w32(out, uint32_t(g_osk_result.load()));
   const uint32_t cap = K().r32(out + 4), str = K().r32(out + 8);
   if (!str || !cap) return;
   const uint32_t n = std::min<uint32_t>(uint32_t(g_osk_text.size()), cap - 1);
@@ -122,6 +250,12 @@ void cellOskDialogUnloadAsync(ppu::Context& c) {
   ok(c);
 }
 void cellOskDialogGetInputText(ppu::Context& c) { write_osk_result(a32(c, 0)); ok(c); }
+void cellOskDialogAbort(ppu::Context& c) {
+#if defined(_WIN32)
+  if (void* h = g_osk_hwnd.load()) { g_osk_result = 2; PostMessageW(static_cast<HWND>(h), WM_CLOSE, 0, 0); }
+#endif
+  ok(c);
+}
 void cellSysutilGetBgmPlaybackStatus(ppu::Context& c) {
   if (const uint32_t p = a32(c, 0)) std::memset(G(p), 0, 32);  // stopped, disabled
   ok(c);
@@ -161,9 +295,10 @@ void register_misc_modules() {
   R("cellSysutil", cellOskDialogLoadAsync);
   R("cellSysutil", cellOskDialogUnloadAsync);
   R("cellSysutil", cellOskDialogGetInputText);
+  R("cellSysutil", cellOskDialogAbort);
   R("cellSysutil", cellSysutilGetBgmPlaybackStatus);
   for (const char* n : {"cellOskDialogSetKeyLayoutOption", "cellOskDialogSetLayoutMode", "cellOskDialogSetDeviceMask",
-                        "cellOskDialogAddSupportLanguage", "cellOskDialogSetInitialInputDevice", "cellOskDialogAbort",
+                        "cellOskDialogAddSupportLanguage", "cellOskDialogSetInitialInputDevice",
                         "cellOskDialogDisableDimmer", "cellOskDialogSetSeparateWindowOption", "cellOskDialogSetInitialKeyLayout"})
     register_function("cellSysutil", n, ok);
   R("cellNetCtl", cellNetCtlGetState);
