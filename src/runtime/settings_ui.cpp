@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +78,7 @@ struct ModEntry {
   bool has_ini = false;
   bool runtime_loaded = false;
   std::string runtime_detail;
+  std::string description;  // shown when the mod is selected in the list
 };
 
 struct DialogState {
@@ -133,6 +135,44 @@ void enable_dark_bar(HWND hwnd) {
   }
 }
 
+// A mod's description for the Mods tab: the "description=" line of its .ini ("\n" starts a new line), otherwise the first
+// comment line of the .ini, otherwise nothing.
+std::string read_mod_description(const std::filesystem::path& ini) {
+  std::ifstream f(ini);
+  if (!f) return {};
+  auto trim = [](std::string t) {
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\t' || t.front() == '#')) t.erase(t.begin());
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r')) t.pop_back();
+    return t;
+  };
+  std::string line, first_comment, desc;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line[0] == '#') {
+      if (first_comment.empty()) first_comment = trim(line);
+      continue;
+    }
+    const size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    if (to_lower_ascii(trim(line.substr(0, eq))) == "description") {
+      desc = trim(line.substr(eq + 1));
+      for (size_t i = 0; (i = desc.find("\\n", i)) != std::string::npos;) desc.replace(i, 2, "\n");
+      break;
+    }
+  }
+  return desc.empty() ? first_comment : desc;
+}
+
+std::wstring mod_info_text(const ModEntry& m) {
+  std::wstring t;
+  if (!m.description.empty()) {
+    std::wstring d = widen(m.description);
+    for (size_t i = 0; (i = d.find(L'\n', i)) != std::wstring::npos; i += 2) d.replace(i, 1, L"\r\n");
+    t = d + L"\r\n\r\n";
+  }
+  t += L"File: " + widen(m.filename) + (m.has_ini ? L"  |  Config: " + m.ini_path.filename().wstring() : L"  |  No .ini config");
+  return t;
+}
+
 void refresh_mods_list(DialogState& s) {
   const int prev_sel = int(SendMessageW(s.c_mod_list, LB_GETCURSEL, 0, 0));
   SendMessageW(s.c_mod_list, LB_RESETCONTENT, 0, 0);
@@ -151,6 +191,7 @@ void refresh_mods_list(DialogState& s) {
       m.ini_path = entry.path();
       m.ini_path.replace_extension(".ini");
       m.has_ini = std::filesystem::exists(m.ini_path, ec);
+      if (m.has_ini) m.description = read_mod_description(m.ini_path);
       for (const auto& rs : runtime_list) {
         if (to_lower_ascii(rs.filename) == to_lower_ascii(m.filename)) {
           m.runtime_loaded = rs.loaded;
@@ -190,8 +231,7 @@ void refresh_mods_list(DialogState& s) {
   const int sel = (prev_sel >= 0 && prev_sel < int(s.mods.size())) ? prev_sel : 0;
   SendMessageW(s.c_mod_list, LB_SETCURSEL, sel, 0);
   const auto& cur = s.mods[size_t(sel)];
-  std::wstring info = L"File: " + widen(cur.filename) + (cur.has_ini ? L"  |  Config: " + cur.ini_path.filename().wstring() : L"  |  No .ini config");
-  SetWindowTextW(s.c_mod_info, info.c_str());
+  SetWindowTextW(s.c_mod_info, mod_info_text(cur).c_str());
 }
 
 void switch_tab(DialogState& s, int tab) {
@@ -399,8 +439,8 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       s->c_mod_hdr = mk_mod(s->f_hdr, L"STATIC", L"Installed Mods (mods/)", 0, lx, 58, 455, 24);
       s->c_mod_list = mk_mod(s->f_mono, L"LISTBOX", L"",
                              WS_BORDER | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_TABSTOP,
-                             lx, 90, 455, 310, ID_MOD_LIST);
-      s->c_mod_info = mk_mod(s->f_ui, L"STATIC", L"", 0, lx, 410, 455, 22);
+                             lx, 90, 455, 220, ID_MOD_LIST);
+      s->c_mod_info = mk_mod(s->f_ui, L"STATIC", L"", SS_NOPREFIX, lx, 318, 455, 112);
 
       s->b_mod_toggle = mk_mod(s->f_bold, L"BUTTON", L"Toggle On / Off", BS_OWNERDRAW | WS_TABSTOP, lx, 442, 145, 32, ID_MOD_TOGGLE);
       s->b_mod_ini = mk_mod(s->f_bold, L"BUTTON", L"Edit Config (.ini)", BS_OWNERDRAW | WS_TABSTOP, lx + 155, 442, 145, 32, ID_MOD_EDIT_INI);
@@ -460,9 +500,7 @@ LRESULT CALLBACK dlg_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const int sel = int(SendMessageW(s->c_mod_list, LB_GETCURSEL, 0, 0));
         if (sel >= 0 && sel < int(s->mods.size())) {
           const auto& cur = s->mods[size_t(sel)];
-          std::wstring info = L"File: " + widen(cur.filename) +
-                              (cur.has_ini ? L"  |  Config: " + cur.ini_path.filename().wstring() : L"  |  No .ini config");
-          SetWindowTextW(s->c_mod_info, info.c_str());
+          SetWindowTextW(s->c_mod_info, mod_info_text(cur).c_str());
         }
       } else if ((id == ID_MOD_LIST && code == LBN_DBLCLK) || id == ID_MOD_TOGGLE) {
         toggle_selected_mod(*s);
