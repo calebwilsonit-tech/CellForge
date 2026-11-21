@@ -61,8 +61,13 @@ void cellPadGetData(ppu::Context& c) {
   if (!ready(c)) return;
   const uint32_t port = a32(c, 0), out = a32(c, 1);
   if (port >= g_max || !out) return ret(c, CELL_PAD_ERROR_INVALID_PARAMETER);
-  const input::PadState s = input::read(int(port));
+  input::PadState s = input::read(int(port));
   if (!s.connected) return ret(c, CELL_PAD_ERROR_NO_DEVICE);
+  if (input::game_blocked()) {
+    const input::PadState idle;
+    s = idle;
+    s.connected = true;
+  }
 
   uint16_t b[24] = {};
   b[0] = 0;

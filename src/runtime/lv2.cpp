@@ -1074,6 +1074,9 @@ bool event_queue_send_by_key(uint64_t key, uint64_t source, uint64_t d1, uint64_
   return true;
 }
 
+static std::atomic<int> g_syscall_trace_budget{0};
+void trace_next_syscalls(uint32_t count) { g_syscall_trace_budget = int(count); }
+
 #if defined(_WIN32)
 // Reads a guest word without letting a bad address take the crash reporter down with it.
 static uint32_t safe_peek32(uint8_t* base, uint32_t a) {
@@ -1322,9 +1325,13 @@ void Kernel::syscall(ppu::Context& c) {
   }
   static const bool trace = std::getenv("PS3RECOMP_SYSCALL_TRACE") != nullptr;
   static std::atomic<uint32_t> traced{0};
-  if (trace && traced++ < 400) {
+  bool trace_now = trace && traced++ < 400;
+  if (!trace_now && g_syscall_trace_budget.load(std::memory_order_relaxed) > 0 &&
+      g_syscall_trace_budget.fetch_sub(1) > 0)
+    trace_now = true;
+  if (trace_now) {
     static const auto t0 = Clock::now();
-    logf("syscall %3u %-28s r3=0x%llX r4=0x%llX r5=0x%llX lr=0x%llX  t=%.1fms", n, syscall_name(n),
+    logf("syscall %3u %-28s [%s] r3=0x%llX r4=0x%llX r5=0x%llX lr=0x%llX  t=%.1fms", n, syscall_name(n), mark.t.name.c_str(),
          (unsigned long long)c.r[3], (unsigned long long)c.r[4], (unsigned long long)c.r[5],
          (unsigned long long)c.lr, std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
   }

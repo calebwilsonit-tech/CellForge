@@ -42,6 +42,14 @@ struct Ps3RecompModApi {
   // Guest function descriptor (OPD) whose code is the host function `fn`: a pointer the game can call, store in a
   // vtable or hand back as a callback. 0 on failure.
   uint32_t (*make_opd)(ppu::Fn fn);
+  // Log the next `count` PPU syscalls (all threads, with thread names) - for troubleshooting what a stalled game waits on.
+  void (*trace_syscalls)(uint32_t count);
+  // Current state of controller `port` (0 = first pad): bits 0-15 = CellPad DIGITAL1 (SELECT 1, START 8, UP 0x10, RIGHT 0x20,
+  // DOWN 0x40, LEFT 0x80), bits 16-31 = DIGITAL2 (L2 1, R2 2, L1 4, R1 8, TRIANGLE 0x10, CIRCLE 0x20, CROSS 0x40, SQUARE 0x80).
+  // 0xFFFFFFFF when no pad is connected. Lets a mod build its own controller-driven screens.
+  uint32_t (*pad_buttons)(int port);
+  // While `blocked` is non-zero the game sees idle controllers (a mod's own screen owns the pad); pad_buttons() still reads the real state.
+  void (*pad_block_game)(int blocked);
 };
 
 #if defined(_WIN32)

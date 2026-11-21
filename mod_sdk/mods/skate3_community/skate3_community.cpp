@@ -48,12 +48,14 @@ using cellforge::write_u32;
 struct Settings {
   bool enabled = false;   // experimental: off unless the ini says enabled=1
   bool trace = false;                          // log every network call
+  bool flow_trace = false;                     // log the game's sign-in state machine (Skate 3 only; for troubleshooting)
   std::string server_ip = "172.237.109.212";   // community Blaze server (public)
   std::vector<std::string> redirect_hosts = {"gosredirector.ea.com", "downloads.skate*.online.ea.com"};
   std::string np_name = "CellForgeUser";       // online id shown to the game until a real account is signed in
   std::string rpcn_host = "np.rpcs3.net";      // RPCN account service (the one RPCS3 uses)
   int rpcn_port = 31313;
   bool prompt_signin = true;                   // ask for an RPCN login in-game when none is saved
+  bool webkit_autoquit = true;                 // Skate 3: end the front end's browser state as if the page had closed
   bool ws_ok = true;                           // treat "404" from the community server's missing /skate3/ws/ web services as success
   std::string webkit_mode = "skip";            // "skip": never start the game's embedded browser; "standin": inert fake browser
   bool dev_fake_signin = false;                // developer testing: pretend to be signed in with a dummy ticket (no RPCN)
@@ -76,6 +78,8 @@ std::vector<std::string> split_list(const std::string& s) {
   return out;
 }
 
+bool g_webkit_credits = false;  // (experimental: dialog shows blank text) Skate 3: show the community server's credits text in the game's own dialog when a web page is opened
+bool g_webkit_skip_prompt = true;  // Skate 3: skip the browser "exit?" prompt (see FlowWrap<0x0040BA04>)
 void load_settings() {
   HMODULE self = nullptr;
   GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -93,6 +97,7 @@ void load_settings() {
   }
   g_cfg.enabled = cfg.get_bool("enabled", false);
   g_cfg.trace = cfg.get_bool("trace", false);
+  g_cfg.flow_trace = cfg.get_bool("flow_trace", false);
   g_cfg.server_ip = cfg.get_string("server_ip", g_cfg.server_ip);
   const std::string hosts = cfg.get_string("redirect_hosts", "");
   if (!hosts.empty()) g_cfg.redirect_hosts = split_list(hosts);
@@ -103,6 +108,9 @@ void load_settings() {
   g_cfg.dev_fake_signin = cfg.get_bool("dev_fake_signin", false);
   g_cfg.webkit_mode = cfg.get_string("webkit_mode", g_cfg.webkit_mode);
   g_cfg.ws_ok = cfg.get_bool("fake_webservice_ok", true);
+  g_cfg.webkit_autoquit = cfg.get_bool("webkit_autoquit", true);
+  g_webkit_credits = cfg.get_bool("webkit_credits", false);
+  g_webkit_skip_prompt = cfg.get_bool("webkit_skip_prompt", true) && !g_webkit_credits;
 }
 
 // ---- small helpers ------------------------------------------------------------------------------------------
@@ -286,7 +294,17 @@ void h_socketclose(Context& c) {
   }
   closesocket(sk.s);
   trace_flush_fd(fd);
-  { std::lock_guard<std::mutex> lk(g_http_mu); g_http.erase(fd); }
+  {
+    std::lock_guard<std::mutex> lk(g_http_mu);
+    auto it = g_http.find(fd);
+    if (it != g_http.end()) {
+      // Troubleshooting: after the second sign-in "StartLoginProcess" call finishes, log what the game does next.
+      static std::atomic<int> slp{0};
+      if (g_cfg.flow_trace && it->second.head.find("StartLoginProcess") != std::string::npos && ++slp == 2)
+        cellforge::trace_syscalls(1500);
+      g_http.erase(it);
+    }
+  }
   tracef("socketclose(%d)", fd);
   RET(c, 0);
 }
@@ -421,15 +439,34 @@ void h_send(Context& c) {
   with_dontwait(fd, sk, A(c, 3), [&] { n = ::send(sk.s, G(A(c, 1)), int(A(c, 2)), to_wsa_flags(A(c, 3))); });
   if (g_cfg.trace) trace_bytes("send", fd, A(c, 1), n < 0 ? 0 : n, n);
   if (n < 0) return fail_wsa(c);
-  if (g_cfg.ws_ok && n > 0) {
+  if ((g_cfg.ws_ok || g_cfg.flow_trace) && n > 0) {
     std::lock_guard<std::mutex> lk(g_http_mu);
     HttpFix& hf = g_http[fd];
     if (hf.head.size() < 160) {
       for (int i = 0; i < n && hf.head.size() < 160; ++i) hf.head += char(read_u8(A(c, 1) + uint32_t(i)));
       if (hf.head.find("/skate3/ws/") != std::string::npos) hf.ws = true;
     }
+    // Troubleshooting: when the second sign-in "StartLoginProcess" body goes out, log the syscalls that follow.
+    if (g_cfg.flow_trace && hf.head.find("StartLoginProcess") != std::string::npos && n >= 11 && read_u8(A(c, 1)) == 0x70 &&
+        read_u8(A(c, 1) + 1) == 0x6C) {  // body starts with "pl" (platformId=...)
+      static std::atomic<int> bodies{0};
+      if (++bodies == 2) cellforge::trace_syscalls(6000);
+    }
   }
   RET(c, n);
+}
+
+// What EA's web services answered (plain XML, no encoding attribute: the game cannot take one). Empty = leave the reply alone.
+std::string ws_reply_body(const std::string& request_head) {
+  auto is = [&](const char* name) { return request_head.find(std::string("/") + name) != std::string::npos; };
+  const std::string xml = "<?xml version=\"1.0\"?>";
+  if (is("StartLoginProcess"))
+    return xml + "<LoginInfoContainer><privacyFlagContainer /><awardedBoardSales>0</awardedBoardSales><teamInfo><teamId>0</teamId>"
+                 "<numMembers>0</numMembers></teamInfo></LoginInfoContainer>";
+  if (is("SetUserDLC")) return xml + "<BoolContainer><value>true</value></BoolContainer>";
+  if (is("AddAchievement") || is("SetUserAchievements")) return xml + "<IntegerContainer><value>0</value></IntegerContainer>";
+  if (is("UploadAIProfile")) return xml + "<LongContainer><value>2</value></LongContainer>";
+  return std::string();
 }
 
 void h_recv(Context& c) {
@@ -451,19 +488,13 @@ void h_recv(Context& c) {
       if (got > 0) {
         hf->pending.assign(tmp, size_t(got));
         const size_t pos = hf->pending.find("404 Not Found");
-        if (pos != std::string::npos) {
-          hf->pending.replace(pos, 13, "200 OK       ");
-          // The game expects an XML document in the reply (it dereferences the parsed result), so the empty body becomes a
-          // minimal one: an empty <Response> element.
-          const std::string empty_body = "\r\n\r\n0\r\n\r\n";
-          const size_t bpos = hf->pending.find(empty_body, pos);
-          if (bpos != std::string::npos) {
-            static const std::string xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<Response></Response>";
-            char len_hex[16];
-            std::snprintf(len_hex, sizeof len_hex, "%zX", xml.size());
-            hf->pending.replace(bpos + 4, 5, std::string(len_hex) + "\r\n" + xml + "\r\n0\r\n\r\n");
-          }
-          tracef("fd %d: web service reply rewritten from 404 to 200 (+ minimal XML body)", fd);
+        const std::string body = pos != std::string::npos ? ws_reply_body(hf->head) : std::string();
+        if (!body.empty()) {
+          // The community server has none of EA's profile web services. For the calls whose reply format is known, the reply
+          // is replaced by what EA's server would have sent, so the game's own screens get the data they expect.
+          hf->pending = "HTTP/1.1 200 OK\r\nServer: Microsoft-IIS/6.0\r\nContent-Type: text/xml\r\nContent-Length: " +
+                        std::to_string(body.size()) + "\r\n\r\n" + body;
+          tracef("fd %d: web service reply replaced (%u byte body)", fd, unsigned(body.size()));
         }
       } else {
         n = got;
@@ -1075,6 +1106,35 @@ void call_guest(const Context& base, uint32_t opd, uint64_t a0, uint64_t a1 = 0,
   cellforge::call(nc, read_u32(opd));
 }
 
+// ---- the game's embedded-browser front-end state (Skate 3 only) ----
+// The front end's "webkit" state shows web pages (the news feed, the online hub, ...) and ends when the page's script sends it
+// the command "quitwebkit". CellForge has no browser, so no page ever loads and the state would wait forever. When the state is
+// entered, a little later this mod pushes that command into the browser manager's event queue itself (the same game function the
+// real browser thread uses), which sends the front end on as if the page had closed.
+std::atomic<int> g_webkit_quit_countdown{0};
+std::atomic<uint32_t> g_webkit_mgr{0};
+// The browser state was entered. Start-up and later entries alike: the community server's pages only show a credits box and leave.
+void on_webkit_state_entered() {
+  if (!g_webkit_skip_prompt) g_webkit_quit_countdown = g_webkit_credits ? 360 : 90;
+}
+constexpr uint32_t kSkate3WebkitPushEvent = 0x004C8F64;   // Manager::PushEvent(this, const wstring*)
+void push_webkit_command(const Context& c, const char* text) {
+  const uint32_t mgr = g_webkit_mgr.load();
+  if (!mgr) return;
+  const uint32_t len = uint32_t(std::strlen(text));
+  const uint32_t str = cellforge::guest_alloc(16 + 2 * (len + 1), 16);
+  if (!str) return;
+  write_u32(str, str + 16);              // begin
+  write_u32(str + 4, str + 16 + 2 * len); // end
+  write_u32(str + 8, str + 16 + 2 * (len + 1));
+  for (uint32_t i = 0; i < len; ++i) { write_u8(str + 16 + 2 * i, 0); write_u8(str + 16 + 2 * i + 1, uint8_t(text[i])); }
+  Context nc = c;
+  nc.r[3] = mgr;
+  nc.r[4] = str;
+  cellforge::call(nc, kSkate3WebkitPushEvent);
+  cellforge::logf("skate3_community: told the front end the web page sent \"%s\"", text);
+}
+
 void deliver_commerce_events(const Context& c);
 // sceNp functions this mod doesn't implement yet: log how the game calls them and answer "OK" (the same as the runtime default).
 template <uint32_t NID>
@@ -1109,6 +1169,7 @@ void h_sysutil_check_callback(Context& c) {
   if (status) call_guest(c, cb, uint64_t(int64_t(g_np_status.load())), 0, arg);
   if (ticket) call_guest(c, cb, 255, uint64_t(int64_t(ticket_result)), arg);
   deliver_commerce_events(c);
+  if (g_webkit_quit_countdown.load() > 0 && g_webkit_quit_countdown.fetch_sub(1) == 1) push_webkit_command(c, "quitwebkit");
   c.r[3] = result;
 }
 
@@ -1226,11 +1287,157 @@ constexpr uint32_t kSkate3WebkitThread = 0x004C9C84;
 constexpr uint32_t kSkate3WebkitThreadFirstWord = 0xF821FF21;  // stdu r1,-224(r1)
 void h_skip_webkit_thread(Context& c) {
   cellforge::log("skate3_community: ending the game's 'webkit' thread (no embedded browser in CellForge)");
+  // The thread normally runs the start-up routine first, which ends by setting the manager's "initialised" byte; the front
+  // end waits for it, so set it (r3 is the manager object).
+  const uint32_t self = uint32_t(c.r[3]);
+  if (self >= 0x10000) write_u8(self + 1107, 1);
+  // The front end also checks the manager's "browser ready" byte (this+1104) before it moves on from its browser state.
+  if (self >= 0x10000) write_u8(self + 1104, 1);
+  if (self >= 0x10000) g_webkit_mgr = self;
   c.r[3] = 0;
 }
 void h_skip_webkit_init(Context& c) {
   cellforge::log("skate3_community: skipping the game's embedded browser start-up (not available in CellForge)");
+  // The real routine ends by setting the manager's "initialised" byte (this+1107); the front end waits for it, so set it.
+  const uint32_t self = uint32_t(c.r[3]);
+  if (self >= 0x10000) write_u8(self + 1107, 1);
   c.r[3] = 0;
+}
+
+// Skate 3 specific troubleshooting aid: logs calls to a few of the game's own sign-in state-machine functions (wrapping them,
+// not replacing them) so the order of events around the online sign-in is visible in the log.
+template <uint32_t ADDR>
+struct FlowWrap {
+  static inline ppu::Fn orig = nullptr;
+  static inline std::atomic<int> count{0};
+  static void fn(Context& c) {
+    const uint32_t r3 = uint32_t(c.r[3]), r4 = uint32_t(c.r[4]), r5 = uint32_t(c.r[5]);
+    const int n = count.fetch_add(1);
+    static std::atomic<uint32_t> signin_obj{0};
+    if (ADDR == 0x0043C454) signin_obj = r3;
+    if (ADDR == 0x0043C454 && r4 == 1) {
+      static std::atomic<int> ticks{0};
+      const int t = ticks.fetch_add(1) + 1;
+      if (t % 120 == 0) cellforge::logf("skate3_community: [flow] sign-in controller ticks so far: %d", t);
+    }
+    bool show = n < 300;
+    if (ADDR == 0x0043C454 && r4 == 1 && n > 3) show = false;          // per-frame tick
+    if (ADDR == 0x00418DF4 && r4 == 1) show = false;
+    if (ADDR == 0x0040BA04) show = n < 1500;
+    if (show) {
+      if (ADDR == 0x0040BA04) {
+        // EA state machine: ChangeState(fsm = r3, new state = member-function pointer packed in r4 {ptr (high), adjust (low)}).
+        const uint32_t hi = uint32_t(c.r[4] >> 32), lo = uint32_t(c.r[4]);
+        uint32_t code = 0;
+        if (!(hi & 1) && hi >= 0x10000 && hi < 0x02000000) code = read_u32(hi);
+        cellforge::logf("skate3_community: [fsm] 0x%08X -> state %s0x%08X (code 0x%08X, adj 0x%X) r5=%u", r3, (hi & 1) ? "virtual slot " : "", (hi & 1) ? hi - 1 : hi, code, lo, r5);
+      } else if (ADDR == 0x0043C454)
+        cellforge::logf("skate3_community: [flow] SignIn::OnEvent(this=0x%08X, event=%u) flags 712/713/714 = %u/%u/%u", r3, r4,
+                        read_u8(r3 + 712), read_u8(r3 + 713), read_u8(r3 + 714));
+      else
+        cellforge::logf("skate3_community: [flow] fn 0x%08X(r3=0x%08X r4=0x%08X r5=0x%08X)", ADDR, r3, r4, r5);
+    }
+    if (ADDR == 0x0040BA04 && uint32_t(c.r[4] >> 32) == 0x017BB760) on_webkit_state_entered();  // the browser state was entered
+    // With no browser the game would ask "are you sure you want to exit the web browser?" (a Yes/No prompt over nothing) before
+    // leaving the page. Go straight to the state that follows the page closing instead.
+    if (ADDR == 0x0040BA04 && g_webkit_skip_prompt && uint32_t(c.r[4] >> 32) == 0x017BA360) {
+      c.r[4] = (uint64_t(0x017BAD88) << 32) | uint32_t(c.r[4]);
+      cellforge::log("skate3_community: skipped the browser exit prompt");
+    }
+    orig(c);
+    if (show && ADDR == 0x0043C454)
+      cellforge::logf("skate3_community: [flow]   -> flags 712/713/714 = %u/%u/%u", read_u8(r3 + 712), read_u8(r3 + 713), read_u8(r3 + 714));
+  }
+};
+template <uint32_t ADDR>
+void flow_hook(uint32_t first_word) {
+  if (read_u32(ADDR) != first_word) return;
+  FlowWrap<ADDR>::orig = cellforge::hook(ADDR, &FlowWrap<ADDR>::fn);
+}
+
+// Troubleshooting (Skate 3): log the text ids the game puts into its pop-up dialogs (message / title / button labels).
+std::string peek_cstr(uint32_t p) {
+  std::string out;
+  if (p < 0x10000 || p >= 0xD0000000u) return out;
+  for (int i = 0; i < 80; ++i) {
+    const uint8_t b = read_u8(p + uint32_t(i));
+    if (b == 0) break;
+    out += (b >= 32 && b < 127) ? char(b) : '?';
+  }
+  return out;
+}
+template <uint32_t ADDR, int STRARG, const char* WHAT>
+struct DialogLog {
+  static inline ppu::Fn orig = nullptr;
+  static void fn(Context& c) {
+    const uint32_t sp = uint32_t(c.r[STRARG]);
+    const std::string t = peek_cstr(sp);
+    if (!t.empty()) cellforge::logf("skate3_community: [dialog] %s: %s", WHAT, t.c_str());
+    if (orig) orig(c);
+  }
+};
+constexpr char kWhatMsg[] = "message", kWhatTitle[] = "title", kWhatBtn[] = "button";
+template <uint32_t ADDR, int STRARG, const char* WHAT>
+void dialog_log_hook(uint32_t first_word) {
+  if (read_u32(ADDR) != first_word) return;
+  DialogLog<ADDR, STRARG, WHAT>::orig = cellforge::hook(ADDR, &DialogLog<ADDR, STRARG, WHAT>::fn);
+}
+
+template <uint32_t ADDR>
+struct RetLog {
+  static inline ppu::Fn orig = nullptr;
+  static inline std::atomic<int> n{0};
+  static void fn(Context& c) {
+    const uint32_t r3 = uint32_t(c.r[3]);
+    const uint8_t b2612 = ADDR == 0x0040FC8C ? read_u8(r3 + 2612) : 0, b2614 = ADDR == 0x0040FC8C ? read_u8(r3 + 2614) : 0;
+    if (orig) orig(c);
+    if (n.fetch_add(1) < 6)
+      cellforge::logf("skate3_community: [ret] fn 0x%08X(r3=0x%08X) -> %lld (state obj +2612=%u +2614=%u)", ADDR, r3,
+                      (long long)int64_t(c.r[3]), unsigned(b2612), unsigned(b2614));
+  }
+};
+template <uint32_t ADDR>
+void ret_log_hook(uint32_t first_word) {
+  if (read_u32(ADDR) != first_word) return;
+  RetLog<ADDR>::orig = cellforge::hook(ADDR, &RetLog<ADDR>::fn);
+}
+
+// The community server's web pages (every "/skate3/webkit/..." address) only show this text in a message box and then leave. The
+// game's exit prompt is used as the box: its text is swapped for the credits (the game's text system shows plain text as it is).
+constexpr const char* kCreditsTitle = "Skate 3 Community Server";
+constexpr const char* kCreditsText =
+    "Skate 3 Custom Blaze Server by Wispp!^^Special thanks for prior Blaze/TDF reversing efforts:^^Aim4kill^gamingrobot^Tratos";
+uint32_t guest_cstr(const char* t) {
+  static std::map<const char*, uint32_t> cache;
+  auto it = cache.find(t);
+  if (it != cache.end()) return it->second;
+  const uint32_t len = uint32_t(std::strlen(t));
+  const uint32_t g = cellforge::guest_alloc(len + 1, 16);
+  if (!g) return 0;
+  for (uint32_t i = 0; i <= len; ++i) write_u8(g + i, uint8_t(t[i]));
+  cache[t] = g;
+  return g;
+}
+bool g_credits_dialog = false;  // set while the browser-exit prompt is being built
+template <uint32_t ADDR, bool TITLE>
+struct CreditsText {
+  static inline ppu::Fn orig = nullptr;
+  static void fn(Context& c) {
+    const std::string t = peek_cstr(uint32_t(c.r[4]));
+    if (!TITLE && t == "ID_WEBKIT_EXIT_CONFIRMATION_MESSAGE") {
+      g_credits_dialog = true;
+      if (const uint32_t g = guest_cstr(kCreditsText)) c.r[4] = g;
+      cellforge::log("skate3_community: [credits] put the community server credits text into the browser-exit dialog");
+    } else if (TITLE && g_credits_dialog && t == "ID_COMMON_WARNING_TITLE") {
+      if (const uint32_t g = guest_cstr(kCreditsTitle)) c.r[4] = g;
+    }
+    if (orig) orig(c);
+  }
+};
+template <uint32_t ADDR, bool TITLE>
+void credits_hook(uint32_t first_word) {
+  if (read_u32(ADDR) != first_word) return;
+  CreditsText<ADDR, TITLE>::orig = cellforge::hook(ADDR, &CreditsText<ADDR, TITLE>::fn);
 }
 
 // ---- installation ------------------------------------------------------------------------------------------------------
@@ -1306,6 +1513,26 @@ CELLFORGE_MOD_ENTRY(api) {
   } else {
     cellforge::log("skate3_community: could not find the game's browser start-up routine; using the inert stand-in instead");
     install("cellPrx_EAWebkitPrx", "nid:0xB84A04AC", h_webkit_get_interface);
+  }
+
+  if (g_webkit_credits && g_cfg.webkit_mode != "standin") {
+    credits_hook<0x00C7BBC4, false>(0x38630080);  // dialog message
+  }
+  if (g_cfg.flow_trace) {
+    ret_log_hook<0x0040FC8C>(0xF821FF81);
+    ret_log_hook<0x004C29B0>(0x81230000);
+    dialog_log_hook<0x00C7BBC4, 4, kWhatMsg>(0x38630080);   // dialog message id
+    dialog_log_hook<0x00C7BBFC, 4, kWhatTitle>(0x7C862378); // dialog title id
+    dialog_log_hook<0x00C7BB84, 5, kWhatBtn>(0x54843830);   // dialog button label (r4 = index)
+  }
+  if (g_cfg.webkit_mode != "standin" && g_cfg.webkit_autoquit) flow_hook<0x0040BA04>(0xF821FF61);  // watches for the browser state
+  if (g_cfg.flow_trace) {
+    flow_hook<0x0043C454>(0x2B840004);  // sign-in controller OnEvent(this, event)
+    flow_hook<0x00423A7C>(0xF821FF41);  // reply handler (the HTTP/Blaze result message)
+    flow_hook<0x00418DF4>(0xF821FF81);  // state check
+    flow_hook<0x00435EC0>(0x3943004C);  // sign-in start (clears the flags)
+    flow_hook<0x0049EA50>(0xF821FF81);  // deliver a result message to its listener
+    flow_hook<0x00B27BD0>(0xF821FF51);  // result dispatch
   }
 
   // sceNpCommerce2: answer the game's store scan (see above)

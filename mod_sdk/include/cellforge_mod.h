@@ -90,6 +90,14 @@ struct Ps3RecompModApi {
   uint32_t (*guest_alloc)(uint32_t size, uint32_t align);
   // Guest function descriptor (OPD) whose code is the host function `fn` (for vtables / callbacks). 0 on failure.
   uint32_t (*make_opd)(ppu::Fn fn);
+  // Log the next `count` PPU syscalls (all threads, with thread names). Troubleshooting aid.
+  void (*trace_syscalls)(uint32_t count);
+  // Current state of controller `port` (0 = first pad): bits 0-15 = CellPad DIGITAL1 (SELECT 1, START 8, UP 0x10, RIGHT 0x20,
+  // DOWN 0x40, LEFT 0x80), bits 16-31 = DIGITAL2 (L2 1, R2 2, L1 4, R1 8, TRIANGLE 0x10, CIRCLE 0x20, CROSS 0x40, SQUARE 0x80).
+  // 0xFFFFFFFF when no pad is connected. Lets a mod build its own controller-driven screens.
+  uint32_t (*pad_buttons)(int port);
+  // While `blocked` is non-zero the game sees idle controllers (a mod's own screen owns the pad); pad_buttons() still reads the real state.
+  void (*pad_block_game)(int blocked);
 };
 
 #if defined(_WIN32)
@@ -179,6 +187,14 @@ inline ppu::Fn hook_import(const char* module, const char* name, ppu::Fn replace
   if (!g_api || !g_api->hle_code) return nullptr;
   const uint32_t code = g_api->hle_code(module, name);
   return code ? g_api->hook(code, replacement) : nullptr;
+}
+
+inline void pad_block_game(bool blocked) { if (g_api && g_api->pad_block_game) g_api->pad_block_game(blocked ? 1 : 0); }
+
+inline uint32_t pad_buttons(int port = 0) { return (g_api && g_api->pad_buttons) ? g_api->pad_buttons(port) : 0xFFFFFFFFu; }
+
+inline void trace_syscalls(uint32_t count) {
+  if (g_api && g_api->trace_syscalls) g_api->trace_syscalls(count);
 }
 
 inline uint32_t make_opd(ppu::Fn fn) { return (g_api && g_api->make_opd) ? g_api->make_opd(fn) : 0; }

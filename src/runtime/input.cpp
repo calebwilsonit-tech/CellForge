@@ -1,4 +1,5 @@
 #define _CRT_SECURE_NO_WARNINGS
+#include <atomic>
 #include "input.h"
 #include "rsx.h"
 
@@ -145,6 +146,10 @@ void set_provider(Provider p) {
   std::lock_guard<std::mutex> lk(g_m);
   g_provider = std::move(p);
 }
+
+static std::atomic<bool> g_game_blocked{false};
+void set_game_blocked(bool b) { g_game_blocked = b; }
+bool game_blocked() { return g_game_blocked.load(); }
 
 PadState read(int port) {
   Provider p;

@@ -33,6 +33,10 @@ void set_provider(Provider p);
 // Reads one port through the current provider. Pressure values that the provider
 // left at zero are derived from the digital buttons.
 PadState read(int port);
+// While blocked, the game sees pads that are connected but idle (a mod's own screen, such as a menu, owns the controller).
+// Mods still read the real state through read().
+void set_game_blocked(bool blocked);
+bool game_blocked();
 
 // HID controllers (DualSense / DualShock 4 / generic USB & Bluetooth HID gamepads).
 bool sony_pad_read(int index, PadState& out);

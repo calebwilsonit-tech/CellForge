@@ -239,4 +239,6 @@ uint32_t mmapper_unmap_memory(uint32_t addr, uint32_t* id);
 // Name of a syscall number, for logs ("" if unknown).
 const char* syscall_name(uint32_t n);
 
+// Logs the next `count` syscalls from any PPU thread (used by mods for troubleshooting).
+void trace_next_syscalls(uint32_t count);
 }  // namespace lv2
